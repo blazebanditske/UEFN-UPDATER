@@ -1,5 +1,14 @@
 # uefn-link
 
+**Want the easy version?** There is a double-clickable app:
+[docs/APP.md](docs/APP.md). One file, no install, drag-and-drop uploads, and a
+single button that sends instructions to UEFN.
+
+**Connecting this to an OpenHands agent?** See
+[docs/CONNECT-UEFN-TO-OPENHANDS.md](docs/CONNECT-UEFN-TO-OPENHANDS.md) for the
+full step-by-step guide, including how to drive a live UEFN session from
+Agent Canvas or the app.all-hands.dev UI.
+
 An agent-controlled link to **Unreal Editor for Fortnite (UEFN)**. It reads and
 writes Verse, builds it, drives the Scene Graph, configures Creative devices,
 runs play sessions, and executes Python inside the editor for asset work such as
