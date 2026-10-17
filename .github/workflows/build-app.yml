@@ -1,0 +1,108 @@
+name: Build UEFN Link app
+
+# Builds the double-clickable app on real Windows, macOS, and Linux runners.
+# PyInstaller cannot cross-compile, so the Windows .exe has to be produced on
+# Windows -- this workflow is what makes that happen without a Windows machine
+# on hand.
+#
+# Downloads: open the workflow run and grab the artifact, or see the Releases
+# page for tagged builds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "uefn_link_app.py"
+      - "build_app.py"
+      - "uefn_link/**"
+      - ".github/workflows/build-app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: UEFN-Link-Windows
+            path: dist/UEFN Link.exe
+          - os: macos-latest
+            artifact: UEFN-Link-macOS
+            path: dist/UEFN Link
+          - os: ubuntu-latest
+            artifact: UEFN-Link-Linux
+            path: dist/UEFN Link
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Run tests
+        run: |
+          python -m pip install pytest
+          python -m pytest -q
+
+      - name: Build the app
+        run: python build_app.py
+
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -x
+          # Start it on a free port, confirm it serves the UI, then stop it.
+          "./${{ matrix.path }}" --port 8799 --no-browser --workspace ./_smoke &
+          APP_PID=$!
+          sleep 8
+          curl -s --max-time 10 http://127.0.0.1:8799/ | grep -q "UEFN Link"
+          echo "UI served OK"
+          curl -s --max-time 10 http://127.0.0.1:8799/api/status | grep -q "workspace"
+          echo "API responded OK"
+          kill $APP_PID 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+  release:
+    name: Attach binaries to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename for clarity
+        run: |
+          set -e
+          cd artifacts
+          mv UEFN-Link-Windows/"UEFN Link.exe" "UEFN-Link.exe"
+          mv UEFN-Link-macOS/"UEFN Link" "UEFN-Link-macos"
+          mv UEFN-Link-Linux/"UEFN Link" "UEFN-Link-linux"
+          chmod +x UEFN-Link-macos UEFN-Link-linux
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/UEFN-Link.exe
+            artifacts/UEFN-Link-macos
+            artifacts/UEFN-Link-linux
