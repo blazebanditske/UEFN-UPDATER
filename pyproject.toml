@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uefn-link"
+version = "0.1.0"
+description = "Link an AI agent to Unreal Editor for Fortnite (UEFN) via its official embedded Unreal MCP server: Verse, Scene Graph, Creative devices, sessions, and Python asset pipelines."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+uefn-link = "uefn_link.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["uefn_link*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
