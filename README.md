@@ -39,6 +39,11 @@ UEFN editor process ── Unreal MCP server ── toolsets
 
 ## Setup
 
+**Connecting this to an OpenHands agent?** See
+[docs/CONNECT-UEFN-TO-OPENHANDS.md](docs/CONNECT-UEFN-TO-OPENHANDS.md) for the
+full step-by-step guide, including how to drive a live UEFN session from
+Agent Canvas or the app.all-hands.dev UI.
+
 Three steps, two of which are in UEFN.
 
 ### 1. In UEFN, enable the two settings
