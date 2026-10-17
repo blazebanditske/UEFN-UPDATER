@@ -109,3 +109,25 @@ The only simulated component should be the editor itself.
 - `pytest` and `pyflakes` for development only.
 - The editor is loopback-only and unauthenticated. `HttpTransport` refuses
   non-local hosts on purpose; do not add a remote mode.
+
+## Agent backend, verified facts
+
+These cost real debugging time to establish. Do not re-derive them.
+
+- The local backend is `agent-canvas --backend-only` from
+  `@openhands/agent-canvas` (npm). It serves the agent-server REST API.
+- It defaults to port **8000**, which collides with UEFN's own MCP server.
+  The app uses **3000** and adapts if that is busy. Never point the backend at
+  8000.
+- `POST /api/conversations` **requires** `agent.llm` (model, api_key, base_url).
+  Omitting it is HTTP 422. Omitting `agent` entirely is also 422.
+- The session key at `~/.openhands/agent-canvas/api-key.txt` authorizes the
+  backend API. It is **not** an LLM credential; using it as one gives
+  `LLMAuthenticationError`.
+- `openhands login` (OAuth device flow) writes `~/.openhands/agent_settings.json`
+  with the model, proxy URL, and a minted key. It mints that key from
+  `GET /api/keys/llm/byor`, which returns **HTTP 402** until the account has
+  credits. A `201` conversation that errors on run is almost always this.
+- The app therefore resolves the LLM key *before* starting a conversation and
+  refuses with a clear message if there is none, instead of failing later.
+

@@ -77,9 +77,9 @@ Opens your browser automatically. Stdlib only, no dependencies.
 
 The app is three steps.
 
-### 1. Get both dots green
+### 1. Get three dots green
 
-The window shows two status rows. Both must be green.
+The window shows three status rows. All must be green.
 
 **Unreal Editor for Fortnite** — the editor is open, with your project, and its
 MCP server is answering.
@@ -93,15 +93,56 @@ If it is red:
 
 **Agent backend (this machine)** — the thing that actually runs the agent.
 
-If it is red, start it:
+The app starts this for you when it launches, and there is a **Start backend**
+button for the case where it is not up yet. To run it by hand:
 
 ```bash
 agent-canvas --backend-only
 ```
 
-Install it first if needed: `uv tool install openhands --python 3.12`.
+Install it first if needed: `npm install -g @openhands/agent-canvas`.
 
-Both dots green means the agent can reach your editor. That is the entire
+The backend listens on port 3000 by default. It deliberately does **not** use
+port 8000, because that is where UEFN's own MCP server lives. If 3000 is taken,
+the app picks another free port automatically.
+
+**Model (OpenHands Cloud)** — the account the agent bills and authenticates
+against.
+
+If it is red, the agent has no API key and every task would fail on its first
+call, so the app refuses to start rather than fail later. Fix it with:
+
+```bash
+openhands login
+```
+
+That opens your browser, has you sign in to your personal OpenHands Cloud
+account, and saves the model, proxy URL, and minted key to
+`~/.openhands/agent_settings.json`. The app reads that file.
+
+> **Note — this needs credits on the account.** `openhands login` mints the key
+> from `GET /api/keys/llm/byor`, which returns **HTTP 402** until the account
+> has credits: *"BYOR key export is not enabled. Purchase credits to enable
+> this feature."* On a fresh personal account (`credits: 0.00`) the login will
+> succeed but no key is issued. Either add credits to the account, or use your
+> own model key — see below.
+
+#### Using your own model key instead
+
+If you would rather not use OpenHands Cloud credits, point the app at any
+OpenAI-compatible endpoint. Set these before launching, or export them in your
+shell:
+
+| Variable | Example |
+| --- | --- |
+| `LLM_MODEL` | `anthropic/claude-sonnet-4-5-20250929` |
+| `LLM_API_KEY` | your provider key |
+| `LLM_BASE_URL` | `https://api.anthropic.com` (or your proxy) |
+
+Environment variables win over `agent_settings.json`. With a key set this way
+the third dot goes green and no Cloud account is involved.
+
+All three dots green means the agent can reach your editor. That is the entire
 prerequisite.
 
 ### 2. Drop in whatever you have
@@ -160,6 +201,21 @@ You now browse conversations at `app.all-hands.dev/canvas/conversations` while
 the agent executes locally, next to UEFN. Same interface, correct execution
 location.
 
+### Your personal Cloud account as the backend
+
+The third status dot is your OpenHands Cloud account being used for one thing
+only: **the model**. The agent still executes locally. This is what
+`openhands login` sets up — it signs in to your personal account and stores the
+model, proxy URL, and key, which the app then sends with each conversation.
+
+So "OpenHands Cloud - personal" and "this machine" are not competing options.
+The account supplies the model; the machine supplies the execution and the
+access to UEFN. The app needs both, which is why it shows both as separate
+dots.
+
+The one prerequisite is credits on the account — see the note in step 1.
+Without them, use your own model key instead; everything else is identical.
+
 ### Uploading through the hosted UI instead
 
 If you would rather upload through the web UI than drag into the app, the files
@@ -185,11 +241,16 @@ is exposed to the network.
 | Route | Purpose |
 | --- | --- |
 | `GET /` | the window |
-| `GET /api/status` | probes UEFN and the backend |
+| `GET /api/status` | probes UEFN, the backend, and the model config |
+| `POST /api/backend/start` | starts `agent-canvas --backend-only` and waits for it |
 | `POST /api/upload` | saves a file to `~/UEFN-Agent/uploads/` |
 | `POST /api/start` | starts a conversation with your instruction |
 | `POST /api/register` | runs `openhands mcp add uefn` |
 | `POST /api/clear` | empties the uploads folder |
+
+`POST /api/start` sends the model configuration with the conversation
+(`agent.llm`). The backend rejects a conversation without it — HTTP 422 — so the
+app resolves the key first and refuses to start if there is none.
 
 The agent is started with a system prompt that encodes the rules that matter:
 compile Verse after writing it, only write UI-visible properties, restart the
@@ -216,8 +277,11 @@ session for new assets, convert coordinates, and never expose the MCP port.
 | --- | --- |
 | `UEFN: nothing listening` | UEFN closed, project not open, or the two project settings are off. Enable both and **restart UEFN**. |
 | `UEFN: HTTP 403` | Something else is on port 8000. Change UEFN's port in **Editor Preferences**, then set `UEFN_MCP_URL`. |
-| `backend: not running` | Run `agent-canvas --backend-only` on this machine. |
+| `backend: not running` | The app starts it automatically. If that failed, run `agent-canvas --backend-only`, or press **Start backend**. |
 | `backend: key rejected` | Stale key. Restart the backend; the app re-reads it. |
+| `Model dot red` | No LLM key. Run `openhands login`, or set `LLM_MODEL` and `LLM_API_KEY`. |
+| `login` succeeds but no key | The account has no credits, so BYOR key export is disabled (HTTP 402). Add credits, or use your own `LLM_API_KEY`. |
+| Agent starts then errors immediately | Almost always the model key. Open the conversation and read the first error event. |
 | "Register" button missing | The `openhands` CLI is not on PATH. `uv tool install openhands --python 3.12`. |
 | Agent has no UEFN tools | MCP servers apply to **new** conversations. Start another. Also check the server is registered on the *same backend* the conversation uses. |
 | Agent edits nothing | The project open in UEFN must be the one you mean. Check with `uefn-link doctor`. |

@@ -5,6 +5,7 @@ the status/start decisions are exercised end to end.
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -17,7 +18,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from tests.fake_uefn import FakeUEFNServer  # noqa: E402
-from tests.test_bridge import FakeBackend  # noqa: E402
+from tests.test_bridge import BackendHandler, FakeBackend  # noqa: E402
 import uefn_link_app as app  # noqa: E402
 
 
@@ -78,6 +79,73 @@ class HelperTests(unittest.TestCase):
     def test_free_port_returns_usable_port(self):
         port = app.free_port(0)
         self.assertGreater(port, 0)
+
+    def test_backend_port_does_not_collide_with_uefn(self):
+        """UEFN's MCP server defaults to 8000, so the backend must not use it."""
+        self.assertNotEqual(app.DEFAULT_BACKEND_PORT, 8000)
+        self.assertNotIn(":8000", app.BACKEND_URL)
+
+
+class LlmResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.original = app.AGENT_SETTINGS_PATH
+        for var in ("LLM_MODEL", "LLM_API_KEY", "LLM_BASE_URL"):
+            os.environ.pop(var, None)
+
+    def tearDown(self):
+        app.AGENT_SETTINGS_PATH = self.original
+        for var in ("LLM_MODEL", "LLM_API_KEY", "LLM_BASE_URL"):
+            os.environ.pop(var, None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_env_override_wins(self):
+        os.environ["LLM_MODEL"] = "my/model"
+        os.environ["LLM_API_KEY"] = "sk-env"
+        app.AGENT_SETTINGS_PATH = os.path.join(self.tmp, "none.json")
+        llm = app.resolve_llm()
+        self.assertEqual(llm["model"], "my/model")
+        self.assertEqual(llm["api_key"], "sk-env")
+
+    def test_reads_agent_settings_from_login(self):
+        path = os.path.join(self.tmp, "agent_settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"llm": {"model": "openhands/deepseek-v4.1-flash",
+                               "api_key": "sk-login",
+                               "base_url": "https://llm-proxy.app.all-hands.dev/"}}, fh)
+        app.AGENT_SETTINGS_PATH = path
+        llm = app.resolve_llm()
+        self.assertEqual(llm["model"], "openhands/deepseek-v4.1-flash")
+        self.assertEqual(llm["api_key"], "sk-login")
+
+    def test_missing_key_returns_none(self):
+        app.AGENT_SETTINGS_PATH = os.path.join(self.tmp, "none.json")
+        self.assertIsNone(app.resolve_llm())
+
+    def test_corrupt_settings_do_not_raise(self):
+        path = os.path.join(self.tmp, "agent_settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        app.AGENT_SETTINGS_PATH = path
+        self.assertIsNone(app.resolve_llm())
+
+    def test_status_never_leaks_the_key(self):
+        os.environ["LLM_API_KEY"] = "sk-super-secret"
+        ok, detail = app.llm_status()
+        self.assertTrue(ok)
+        self.assertNotIn("sk-super-secret", detail)
+
+
+class BackendStartTests(unittest.TestCase):
+    def test_start_reports_missing_canvas(self):
+        original = app.has_agent_canvas
+        app.has_agent_canvas = lambda: False
+        try:
+            ok, detail = app.start_backend()
+            self.assertFalse(ok)
+            self.assertIn("agent-canvas", detail)
+        finally:
+            app.has_agent_canvas = original
 
 
 class PageTests(unittest.TestCase):
@@ -199,6 +267,7 @@ class ApiTests(unittest.TestCase):
             app.UEFN_MCP_URL = f"http://127.0.0.1:{editor.port}/mcp"
             app.BACKEND_URL = backend.url
             os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            os.environ["LLM_API_KEY"] = "sk-test"
             try:
                 with AppServer(self.tmp) as srv:
                     srv.post("/api/upload", raw=b"art", headers={"X-Filename": "concept.png"})
@@ -210,6 +279,50 @@ class ApiTests(unittest.TestCase):
             finally:
                 app.UEFN_MCP_URL, app.BACKEND_URL = original_url, original_back
                 os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+                os.environ.pop("LLM_API_KEY", None)
+
+    def test_start_refuses_when_no_llm_configured(self):
+        with FakeUEFNServer() as editor, FakeBackend() as backend:
+            original_url, original_back = app.UEFN_MCP_URL, app.BACKEND_URL
+            original_settings = app.AGENT_SETTINGS_PATH
+            app.UEFN_MCP_URL = f"http://127.0.0.1:{editor.port}/mcp"
+            app.BACKEND_URL = backend.url
+            app.AGENT_SETTINGS_PATH = os.path.join(self.tmp, "missing.json")
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            for var in ("LLM_API_KEY", "LLM_MODEL"):
+                os.environ.pop(var, None)
+            try:
+                with AppServer(self.tmp) as srv:
+                    status, data = srv.post("/api/start", {"task": "do a thing"})
+                    self.assertEqual(status, 400)
+                    self.assertIn("No LLM configured", data["error"])
+            finally:
+                app.UEFN_MCP_URL, app.BACKEND_URL = original_url, original_back
+                app.AGENT_SETTINGS_PATH = original_settings
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+
+    def test_start_sends_llm_in_payload(self):
+        """The backend rejects a conversation with no `llm`, so it must be sent."""
+        with FakeUEFNServer() as editor, FakeBackend() as backend:
+            original_url, original_back = app.UEFN_MCP_URL, app.BACKEND_URL
+            app.UEFN_MCP_URL = f"http://127.0.0.1:{editor.port}/mcp"
+            app.BACKEND_URL = backend.url
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            os.environ["LLM_MODEL"] = "openhands/deepseek-v4.1-flash"
+            os.environ["LLM_API_KEY"] = "sk-test"
+            try:
+                with AppServer(self.tmp) as srv:
+                    srv.post("/api/start", {"task": "do a thing"})
+                    payload = BackendHandler.last_payload
+                    self.assertIn("llm", payload["agent"])
+                    self.assertEqual(payload["agent"]["llm"]["model"],
+                                     "openhands/deepseek-v4.1-flash")
+                    self.assertEqual(payload["agent"]["llm"]["api_key"], "sk-test")
+            finally:
+                app.UEFN_MCP_URL, app.BACKEND_URL = original_url, original_back
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+                os.environ.pop("LLM_API_KEY", None)
+                os.environ.pop("LLM_MODEL", None)
 
     def test_unknown_route_404(self):
         with AppServer(self.tmp) as srv:

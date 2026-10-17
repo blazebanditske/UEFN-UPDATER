@@ -21,6 +21,8 @@ from uefn_openhands_bridge import main, probe_mcp  # noqa: E402
 class BackendHandler(BaseHTTPRequestHandler):
     """Stands in for a local Agent Canvas backend."""
 
+    last_payload = None
+
     def log_message(self, *args):  # keep test output clean
         pass
 
@@ -43,8 +45,12 @@ class BackendHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        raw = self.rfile.read(length)
         if self.path == "/api/conversations":
+            try:
+                type(self).last_payload = json.loads(raw.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                type(self).last_payload = None
             self._send(200, {"id": "conv-abc123"})
         else:
             self._send(404, {"error": "not found"})

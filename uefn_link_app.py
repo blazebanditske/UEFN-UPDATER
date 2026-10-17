@@ -25,21 +25,38 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "UEFN Link"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DEFAULT_APP_PORT = 8765
 UEFN_MCP_URL = os.environ.get("UEFN_MCP_URL", "http://127.0.0.1:8000/mcp")
-BACKEND_URL = os.environ.get("LOCAL_AGENT_SERVER_URL", "http://127.0.0.1:8000")
+# UEFN's embedded MCP server owns 8000 by default. The agent backend must not
+# default to the same port or the two would compete for it and the status lights
+# would read the wrong service.
+DEFAULT_BACKEND_PORT = 3000
+BACKEND_URL = os.environ.get(
+    "LOCAL_AGENT_SERVER_URL", f"http://127.0.0.1:{DEFAULT_BACKEND_PORT}"
+)
 CLOUD_CANVAS_URL = "https://app.all-hands.dev/canvas/conversations"
 
 HOME_DIR = os.path.expanduser("~")
 WORKSPACE_DIR = os.environ.get("UEFN_AGENT_WORKSPACE", os.path.join(HOME_DIR, "UEFN-Agent"))
 UPLOAD_DIR = os.path.join(WORKSPACE_DIR, "uploads")
+
+# Written by `openhands login`, which authenticates against the user's personal
+# OpenHands Cloud account and stores the resulting agent spec (model, proxy base
+# URL, minted key).
+AGENT_SETTINGS_PATH = os.path.join(HOME_DIR, ".openhands", "agent_settings.json")
+
+# Used when nothing more specific is configured. This is the personal Cloud
+# default model; the proxy URL is what OpenHands Cloud issues keys for.
+PERSONAL_LLM_MODEL = "openhands/deepseek-v4.1-flash"
+PERSONAL_LLM_BASE_URL = "https://llm-proxy.app.all-hands.dev/"
 
 # Uploads can be large (videos, level files). Cap generously but not without end.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
@@ -87,6 +104,12 @@ def free_port(preferred: int) -> int:
             except OSError:
                 continue
     return preferred
+
+
+def port_in_use(port: int) -> bool:
+    with socket.socket() as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
 def http_json(url, payload=None, headers=None, timeout=8):
@@ -167,6 +190,98 @@ def has_openhands_cli() -> bool:
     return shutil.which("openhands") is not None
 
 
+def has_agent_canvas() -> bool:
+    return shutil.which("agent-canvas") is not None
+
+
+def resolve_llm() -> dict | None:
+    """Work out which model/key the local agent should use.
+
+    Order of preference:
+      1. Explicit env override (LLM_MODEL / LLM_API_KEY / LLM_BASE_URL).
+      2. ~/.openhands/agent_settings.json, written by `openhands login`. This is
+         the user's personal OpenHands Cloud configuration.
+      3. The personal Cloud defaults, which need a key from somewhere.
+
+    Returns None when no usable key exists, so the caller can explain what is
+    missing instead of starting a conversation that fails on its first call.
+    """
+    model = os.environ.get("LLM_MODEL")
+    api_key = os.environ.get("LLM_API_KEY")
+    base_url = os.environ.get("LLM_BASE_URL")
+
+    if not (model and api_key):
+        try:
+            with open(AGENT_SETTINGS_PATH, encoding="utf-8") as handle:
+                spec = json.load(handle)
+            llm = spec.get("llm") or {}
+            model = model or llm.get("model")
+            api_key = api_key or llm.get("api_key")
+            base_url = base_url or llm.get("base_url")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+
+    if not api_key:
+        return None
+
+    return {
+        "model": model or PERSONAL_LLM_MODEL,
+        "api_key": api_key,
+        "base_url": base_url or PERSONAL_LLM_BASE_URL,
+    }
+
+
+def llm_status() -> tuple[bool, str]:
+    """Human-readable summary of the LLM configuration, without leaking the key."""
+    llm = resolve_llm()
+    if llm is None:
+        return False, "no key — run: openhands login"
+    return True, llm["model"]
+
+
+def start_backend(port: int = DEFAULT_BACKEND_PORT) -> tuple[bool, str]:
+    """Start `agent-canvas --backend-only` and wait for it to answer.
+
+    The editor's MCP server is loopback-only, so the agent has to run on this
+    same machine. Returns as soon as the server responds, or after a timeout.
+    If the preferred port is taken, another port is chosen and BACKEND_URL is
+    repointed, so a busy port is not fatal.
+    """
+    global BACKEND_URL
+
+    if not has_agent_canvas():
+        return False, (
+            "agent-canvas is not installed. Install it with:  "
+            "npm install -g @openhands/agent-canvas"
+        )
+
+    if port_in_use(port):
+        port = free_port(port + 1)
+        BACKEND_URL = f"http://127.0.0.1:{port}"
+
+    log_path = os.path.join(WORKSPACE_DIR, "backend.log")
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    try:
+        with open(log_path, "ab") as log:
+            subprocess.Popen(
+                ["agent-canvas", "--backend-only", "--port", str(port)],
+                stdout=log,
+                stderr=log,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        return False, f"could not launch agent-canvas: {exc}"
+
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        ok, detail = probe_backend()
+        if ok:
+            return True, "started"
+        time.sleep(2)
+    return False, f"started but not answering after 90s (see {log_path})"
+
+
 def staging_summary() -> list[dict]:
     """List staged uploads with sizes."""
     if not os.path.isdir(UPLOAD_DIR):
@@ -231,6 +346,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self._upload()
         elif self.path == "/api/start":
             self._start()
+        elif self.path == "/api/backend/start":
+            self._backend_start()
         elif self.path == "/api/register":
             self._register()
         elif self.path == "/api/clear":
@@ -242,14 +359,21 @@ class AppHandler(BaseHTTPRequestHandler):
     def _status(self):
         uefn_ok, uefn_msg = probe_uefn(UEFN_MCP_URL)
         back_ok, back_msg = probe_backend()
+        llm_ok, llm_msg = llm_status()
         self._json(200, {
             "uefn": {"ok": uefn_ok, "detail": uefn_msg, "url": UEFN_MCP_URL},
             "backend": {"ok": back_ok, "detail": back_msg, "url": BACKEND_URL},
+            "llm": {"ok": llm_ok, "detail": llm_msg},
             "cli": has_openhands_cli(),
+            "canvas": has_agent_canvas(),
             "workspace": WORKSPACE_DIR,
             "uploads": staging_summary(),
             "cloud_url": CLOUD_CANVAS_URL,
         })
+
+    def _backend_start(self):
+        ok, detail = start_backend()
+        self._json(200 if ok else 500, {"ok": ok, "detail": detail})
 
     def _upload(self):
         raw_name = self.headers.get("X-Filename", "")
@@ -328,7 +452,15 @@ class AppHandler(BaseHTTPRequestHandler):
         if not back_ok:
             return self._json(400, {
                 "error": f"The agent backend is not available ({back_detail}).",
-                "fix": "Start it on this machine:  agent-canvas --backend-only",
+                "fix": "Press 'Start backend' above, or run:  agent-canvas --backend-only",
+            })
+
+        llm = resolve_llm()
+        if llm is None:
+            return self._json(400, {
+                "error": "No LLM configured for the agent backend.",
+                "fix": "Run 'openhands login' to use your OpenHands Cloud account, "
+                       "or set LLM_MODEL and LLM_API_KEY.",
             })
 
         uploads = [item["name"] for item in staging_summary()]
@@ -344,6 +476,11 @@ class AppHandler(BaseHTTPRequestHandler):
         payload = {
             "agent": {
                 "kind": "Agent",
+                "llm": {
+                    "model": llm["model"],
+                    "api_key": llm["api_key"],
+                    "base_url": llm["base_url"],
+                },
                 "tools": [
                     {"name": "terminal"},
                     {"name": "file_editor"},
@@ -429,7 +566,9 @@ a{color:var(--accent)}
 <div class="card"><h2>Status</h2>
 <div class="row"><span class="dot" id="d-uefn"></span><span class="label">Unreal Editor for Fortnite</span><span class="meta" id="m-uefn">checking…</span></div>
 <div class="row"><span class="dot" id="d-back"></span><span class="label">Agent backend (this machine)</span><span class="meta" id="m-back">checking…</span></div>
+<div class="row"><span class="dot" id="d-llm"></span><span class="label">Model (OpenHands Cloud)</span><span class="meta" id="m-llm">checking…</span></div>
 <div class="actions"><button class="ghost" onclick="refresh()">Re-check</button>
+<button id="btn-back" onclick="startBackend()">Start backend</button>
 <button class="ghost" id="btn-reg" onclick="register()">Register UEFN with OpenHands</button></div>
 <div class="note" id="workspace"></div>
 </div>
@@ -467,10 +606,24 @@ async function refresh(){
     $('m-uefn').textContent=s.uefn.ok?'connected':s.uefn.detail;
     setDot($('d-back'),s.backend.ok?'ok':'bad');
     $('m-back').textContent=s.backend.ok?'running':s.backend.detail;
+    setDot($('d-llm'),s.llm.ok?'ok':'bad');
+    $('m-llm').textContent=s.llm.detail;
+    $('btn-back').style.display=(s.backend.ok||!s.canvas)?'none':'';
     $('workspace').textContent='Workspace: '+s.workspace;
     renderFiles(s.uploads);
     $('btn-reg').style.display=s.cli?'':'none';
   }catch(e){show('err','Cannot reach the app server. Is it still running?')}
+}
+async function startBackend(){
+  const b=$('btn-back');b.disabled=true;b.textContent='Starting…';
+  show('ok','Starting the agent backend. First run may take a minute.');
+  try{
+    const r=await (await fetch('/api/backend/start',{method:'POST'})).json();
+    if(r.ok){show('ok','Backend is running.');}
+    else{show('err',r.detail);}
+  }catch(e){show('err','Could not start the backend.')}
+  b.disabled=false;b.textContent='Start backend';
+  refresh();
 }
 function renderFiles(items){
   const ul=$('files');ul.innerHTML='';
@@ -547,6 +700,11 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_APP_PORT)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--workspace", default=WORKSPACE_DIR)
+    parser.add_argument(
+        "--no-autostart",
+        action="store_true",
+        help="Do not start the agent backend automatically",
+    )
     args = parser.parse_args(argv)
 
     WORKSPACE_DIR = args.workspace
@@ -559,17 +717,34 @@ def main(argv=None) -> int:
 
     uefn_ok, uefn_detail = probe_uefn(UEFN_MCP_URL)
     back_ok, back_detail = probe_backend()
+    llm_ok, llm_detail = llm_status()
 
     print(f"{APP_NAME} {APP_VERSION}")
     print(f"  app        {url}")
     print(f"  workspace  {WORKSPACE_DIR}")
     print(f"  uefn       {'connected' if uefn_ok else 'NOT reachable (' + uefn_detail + ')'}")
     print(f"  backend    {'running' if back_ok else 'NOT running (' + back_detail + ')'}")
+    print(f"  model      {llm_detail}")
     print()
+
     if not uefn_ok:
         print("  UEFN is not reachable. Open UEFN with your project, enable")
         print("  Python Editor Scripting and UEFN MCP Toolsets, then restart it.")
         print()
+
+    if not back_ok and not args.no_autostart:
+        print("  Starting the agent backend...")
+        started, detail = start_backend()
+        print(f"  backend    {'running' if started else 'FAILED (' + detail + ')'}")
+        if not started:
+            print("  Start it from the app window, or run:  agent-canvas --backend-only")
+        print()
+
+    if not llm_ok:
+        print("  No LLM key found. Run 'openhands login' to use your OpenHands")
+        print("  Cloud account, or set LLM_MODEL and LLM_API_KEY.")
+        print()
+
     print("  Leave this window open. Press Ctrl+C to quit.")
     print()
 
