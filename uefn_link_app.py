@@ -715,6 +715,10 @@ def main(argv=None) -> int:
     server = ThreadingHTTPServer(("127.0.0.1", port), AppHandler)
     url = f"http://127.0.0.1:{port}"
 
+    # Serve immediately. Starting the backend can take up to 90s on a cold
+    # start, and the window must not be blocked behind that.
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
     uefn_ok, uefn_detail = probe_uefn(UEFN_MCP_URL)
     back_ok, back_detail = probe_backend()
     llm_ok, llm_detail = llm_status()
@@ -732,14 +736,6 @@ def main(argv=None) -> int:
         print("  Python Editor Scripting and UEFN MCP Toolsets, then restart it.")
         print()
 
-    if not back_ok and not args.no_autostart:
-        print("  Starting the agent backend...")
-        started, detail = start_backend()
-        print(f"  backend    {'running' if started else 'FAILED (' + detail + ')'}")
-        if not started:
-            print("  Start it from the app window, or run:  agent-canvas --backend-only")
-        print()
-
     if not llm_ok:
         print("  No LLM key found. Run 'openhands login' to use your OpenHands")
         print("  Cloud account, or set LLM_MODEL and LLM_API_KEY.")
@@ -751,8 +747,20 @@ def main(argv=None) -> int:
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
+    if not back_ok and not args.no_autostart:
+        def autostart():
+            print("  Starting the agent backend...")
+            started, detail = start_backend()
+            print(f"  backend    {'running' if started else 'FAILED (' + detail + ')'}")
+            if not started:
+                print("  Start it from the app window, or run:  agent-canvas --backend-only")
+            print()
+
+        threading.Thread(target=autostart, daemon=True).start()
+
     try:
-        server.serve_forever()
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:

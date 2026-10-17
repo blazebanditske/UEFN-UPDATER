@@ -5,10 +5,13 @@ the status/start decisions are exercised end to end.
 """
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -328,6 +331,64 @@ class ApiTests(unittest.TestCase):
         with AppServer(self.tmp) as srv:
             status, data = srv.get("/api/nope")
             self.assertEqual(status, 404)
+
+
+class StartupTests(unittest.TestCase):
+    """The window must come up promptly, before any slow backend work."""
+
+    def test_ui_serves_while_autostart_is_slow(self):
+        """A slow or impossible backend start must not delay the UI.
+
+        Regression test: autostart used to run before the server started, so
+        the window was unreachable for up to 90s and the CI smoke test failed.
+        """
+        tmp = tempfile.mkdtemp()
+        logpath = os.path.join(tmp, "child.log")
+        env = dict(os.environ)
+        env["PATH"] = "/nonexistent"  # agent-canvas cannot be found
+        env["UEFN_AGENT_WORKSPACE"] = tmp
+        env["PYTHONUNBUFFERED"] = "1"
+        log = open(logpath, "w")
+        # Port 0 lets the OS choose; the app prints the port it actually bound.
+        proc = subprocess.Popen(
+            [sys.executable, "-u", os.path.join(ROOT, "uefn_link_app.py"),
+             "--port", "0", "--no-browser", "--workspace", tmp],
+            env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
+        try:
+            url = None
+            served = False
+            for _ in range(10):
+                time.sleep(1)
+                if url is None:
+                    log.flush()
+                    try:
+                        with open(logpath) as fh:
+                            text = fh.read()
+                    except Exception:
+                        text = ""
+                    m = re.search(r"(http://127\.0\.0\.1:\d+)", text)
+                    if m:
+                        url = m.group(1)
+                if url:
+                    try:
+                        with urllib.request.urlopen(url + "/", timeout=3) as r:
+                            if "UEFN Link" in r.read().decode():
+                                served = True
+                                break
+                    except Exception:
+                        continue
+            if not served:
+                log.flush()
+                with open(logpath) as fh:
+                    self.fail(f"UI did not serve within 10s. Child output:\n{fh.read()}")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            log.close()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
