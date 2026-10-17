@@ -715,10 +715,6 @@ def main(argv=None) -> int:
     server = ThreadingHTTPServer(("127.0.0.1", port), AppHandler)
     url = f"http://127.0.0.1:{port}"
 
-    # Serve immediately. Starting the backend can take up to 90s on a cold
-    # start, and the window must not be blocked behind that.
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-
     uefn_ok, uefn_detail = probe_uefn(UEFN_MCP_URL)
     back_ok, back_detail = probe_backend()
     llm_ok, llm_detail = llm_status()
@@ -759,8 +755,7 @@ def main(argv=None) -> int:
         threading.Thread(target=autostart, daemon=True).start()
 
     try:
-        while True:
-            time.sleep(1)
+        server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:
