@@ -23,7 +23,25 @@ change.
 
 ## Get the app
 
-### Option 1 - Build it (one command)
+### Option 1 - Download a built binary
+
+Prebuilt, smoke-tested binaries are attached to the
+[latest release](https://github.com/blazebanditske/UEFN-UPDATER/releases/latest):
+
+| Platform | File | Size |
+| --- | --- | --- |
+| Windows | `UEFN-Link.exe` | ~8.6 MB |
+| macOS | `UEFN-Link-macos` | ~7.6 MB |
+| Linux | `UEFN-Link-linux` | ~19.7 MB |
+
+Each is built on a real runner for that platform, and the build fails unless the
+binary starts and serves its UI. No Python needed on the target machine.
+
+> Windows SmartScreen may warn about an unknown publisher, because the binaries
+> are unsigned. **More info → Run anyway** if you are comfortable with that. To
+> avoid the warning entirely, build it yourself (Option 2).
+
+### Option 2 - Build it (one command)
 
 On the machine that runs UEFN:
 
@@ -39,12 +57,11 @@ That produces a single file in `dist/`:
 | macOS | `UEFN Link.app` | Yes |
 | Linux | `UEFN Link` | Yes (needs `chmod +x`) |
 
-It is ~8 MB and needs no Python installed on the target machine.
-
 > PyInstaller cannot cross-compile. Run `build_app.py` on the platform you want
-> to ship for — build on Windows to get the `.exe`.
+> to ship for — build on Windows to get the `.exe`. The included GitHub Actions
+> workflow does this for all three platforms automatically.
 
-### Option 2 - Run it as a script
+### Option 3 - Run it as a script
 
 No build step, if you already have Python 3.9+:
 
