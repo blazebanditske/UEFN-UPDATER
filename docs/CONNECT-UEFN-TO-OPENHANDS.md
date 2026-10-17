@@ -85,6 +85,37 @@ the open project, and the editor updates as it goes.
 All three end with the agent talking to UEFN. A and B differ only in whether you
 are installing Agent Canvas for the first time.
 
+### Fast path: the bridge script
+
+`tools/uefn_openhands_bridge.py` does the checks and the wiring for you. Run it
+**on the machine running UEFN**:
+
+```bash
+python tools/uefn_openhands_bridge.py check     # can an agent reach UEFN?
+python tools/uefn_openhands_bridge.py register  # add the UEFN MCP server
+python tools/uefn_openhands_bridge.py start "Add a Print to OnBegin and compile"
+```
+
+`check` answers the only question that matters, and prints the fix when the
+answer is no:
+
+```
+UEFN MCP endpoint
+  url       http://127.0.0.1:8000/mcp
+  reachable yes
+  handshake ok
+
+Agent backend (must run on THIS machine)
+  url       http://127.0.0.1:8000
+  reachable yes
+
+  verdict   an agent on this backend CAN edit your project
+```
+
+If the backend line says `NO`, no agent can reach your project yet — start
+`agent-canvas --backend-only` on this machine. That is Track A Step 6. The rest
+of this document explains what the script is checking and why.
+
 ---
 
 ## Track A - Agent runs on your machine (recommended)
