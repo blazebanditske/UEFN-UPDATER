@@ -75,26 +75,60 @@ Opens your browser automatically. Stdlib only, no dependencies.
 
 ## Use it
 
-The app is three steps.
+The app is three steps, and the first one is a single button.
 
 ### 1. Get three dots green
 
-The window shows three status rows. All must be green.
+The window shows three status rows. Press **Fix everything** and the app does
+everything it can on its own, then tells you what is left.
+
+What **Fix everything** does, in order:
+
+| Step | What it does |
+| --- | --- |
+| install backend | Runs `npm install -g @openhands/agent-canvas` if it is missing |
+| start backend | Starts `agent-canvas --backend-only` and waits for it to answer |
+| UEFN auto-start | Writes `bAutoStartServer=True` into UEFN's editor preferences |
+| UEFN project flags | Turns on Python Editor Scripting and UEFN MCP Toolsets in `.uefnproject` |
+| UEFN connection | Checks the editor is actually answering |
+| model credential | Reports whether a model key exists |
+
+Each row also has its own **Fix** button if you would rather do one thing at a
+time.
+
+Two of those steps touch files on disk. Both are additive and both keep a
+backup the first time they write:
+
+- UEFN's editor preferences
+  (`%LOCALAPPDATA%\UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini`)
+  gets a backup at `….ini.uefn-link.bak`. Only the three
+  `ModelContextProtocol` keys are touched; the rest of the file is preserved
+  byte for byte.
+- Your project's `.uefnproject` gets a backup at `.uefnproject.uefn-link.bak`.
+  Only the two beta flags are touched; everything else in the JSON is
+  preserved.
 
 **Unreal Editor for Fortnite** — the editor is open, with your project, and its
 MCP server is answering.
 
-If it is red:
+The app can turn the two required settings on for you, but it cannot restart
+the editor. After the first fix:
 
-1. In UEFN, open **Project Settings** and enable **Python Editor Scripting**
-   *and* **UEFN MCP Toolsets** (under **Beta Access**). Both are required.
-2. **Restart UEFN.** Toolsets publish at startup only.
-3. Click **Re-check** in the app.
+1. **Restart UEFN**, with your project open. Toolsets publish at startup only.
+2. Click **Re-check**.
+
+If it is still red, do it by hand: in UEFN open **Project Settings** and enable
+**Python Editor Scripting** *and* **UEFN MCP Toolsets** (under **Beta Access**).
+Both are required.
+
+> **If Beta Access is missing entirely**, that is not something the app can fix.
+> Epic gates this at the account level, and the validation layer ignores manual
+> file edits without it. See [Limits](#limits-the-app-cannot-fix) below.
 
 **Agent backend (this machine)** — the thing that actually runs the agent.
 
-The app starts this for you when it launches, and there is a **Start backend**
-button for the case where it is not up yet. To run it by hand:
+The app starts this for you when it launches, and **Fix everything** installs
+and starts it if needed. To run it by hand:
 
 ```bash
 agent-canvas --backend-only
@@ -103,22 +137,31 @@ agent-canvas --backend-only
 Install it first if needed: `npm install -g @openhands/agent-canvas`.
 
 The backend listens on port 3000 by default. It deliberately does **not** use
-port 8000, because that is where UEFN's own MCP server lives. If 3000 is taken,
-the app picks another free port automatically.
+port 8000, because that is where UEFN's own MCP server lives.
 
-**Model (OpenHands Cloud)** — the account the agent bills and authenticates
-against.
+> **One backend per machine.** agent-canvas also binds internal ports (18000
+> and 18001) that a running instance already holds, so a second copy fails no
+> matter which ingress port it is given. The app checks first and reuses a
+> healthy backend instead of starting a second one. If some other process holds
+> port 3000, the app says so rather than guessing.
 
-If it is red, the agent has no API key and every task would fail on its first
-call, so the app refuses to start rather than fail later. Fix it with:
+**Model** — the account the agent bills and authenticates against.
+
+If it is red, click **Set key** and paste one. The form has presets for
+OpenHands Cloud, Anthropic, and OpenAI, and writes to
+`~/.openhands/agent_settings.json` — the same file `openhands login` uses, so
+the two paths agree. The file is written `chmod 600`, and the app never shows
+the key again or sends it anywhere except the provider you chose.
+
+This is the one step the app cannot do for you. A model key is account-bound,
+and no program can conjure one. You have two options:
 
 ```bash
 openhands login
 ```
 
-That opens your browser, has you sign in to your personal OpenHands Cloud
-account, and saves the model, proxy URL, and minted key to
-`~/.openhands/agent_settings.json`. The app reads that file.
+That opens your browser, signs you in to your personal OpenHands Cloud account,
+and saves the model, proxy URL, and minted key. The app reads that file.
 
 > **Note — this needs credits on the account.** `openhands login` mints the key
 > from `GET /api/keys/llm/byor`, which returns **HTTP 402** until the account
@@ -129,9 +172,7 @@ account, and saves the model, proxy URL, and minted key to
 
 #### Using your own model key instead
 
-If you would rather not use OpenHands Cloud credits, point the app at any
-OpenAI-compatible endpoint. Set these before launching, or export them in your
-shell:
+Use **Set key** in the app, or set these before launching:
 
 | Variable | Example |
 | --- | --- |
@@ -144,6 +185,21 @@ the third dot goes green and no Cloud account is involved.
 
 All three dots green means the agent can reach your editor. That is the entire
 prerequisite.
+
+<a id="limits-the-app-cannot-fix"></a>
+#### Limits the app cannot fix
+
+Two things stay manual, and both are account-bound rather than technical:
+
+1. **The model key.** Described above. Nothing can generate one for you.
+2. **Epic's account-level beta access.** If UEFN's Project Settings has no
+   **Beta Access** section at all, and the Output Log shows
+   `Python disabled via CVar 'Engine.Python.IsEnabledByDefault'`, the app's
+   file edits will be ignored. That gate is enforced by Epic, not by the files
+   the app writes. You need to be allow-listed, or on a UEFN build where the
+   toolset is generally available.
+
+The app reports both honestly rather than claiming success.
 
 ### 2. Drop in whatever you have
 
@@ -242,7 +298,11 @@ is exposed to the network.
 | --- | --- |
 | `GET /` | the window |
 | `GET /api/status` | probes UEFN, the backend, and the model config |
+| `POST /api/fix-all` | runs every automatic repair in order and reports each step |
+| `POST /api/backend/install` | `npm install -g @openhands/agent-canvas` |
 | `POST /api/backend/start` | starts `agent-canvas --backend-only` and waits for it |
+| `POST /api/uefn/fix` | writes UEFN's auto-start setting and the project beta flags |
+| `POST /api/llm/save` | saves a model key to `agent_settings.json` |
 | `POST /api/upload` | saves a file to `~/UEFN-Agent/uploads/` |
 | `POST /api/start` | starts a conversation with your instruction |
 | `POST /api/register` | runs `openhands mcp add uefn` |
@@ -256,6 +316,18 @@ The agent is started with a system prompt that encodes the rules that matter:
 compile Verse after writing it, only write UI-visible properties, restart the
 session for new assets, convert coordinates, and never expose the MCP port.
 
+### The settings it writes
+
+Two files, both additive, both backed up on first write:
+
+| File | Keys written |
+| --- | --- |
+| `EditorPerProjectUserSettings.ini` | `bAutoStartServer`, `ServerPortNumber`, `ServerUrlPath` under `[/Script/ModelContextProtocol.ModelContextProtocolSettings]` |
+| `.uefnproject` | `dataSets.experimental.pythonExperimental.bEnablePythonForProject`, `dataSets.experimental.toolsets.bEnableToolsetsForProject` |
+
+The INI writer replaces only the exact keys it names, and only inside the named
+section, so a same-named key in another section is left alone.
+
 ---
 
 ## Security
@@ -265,6 +337,12 @@ session for new assets, convert coordinates, and never expose the MCP port.
 - The backend's session key is read from disk and sent only to the local
   backend. It is never logged or displayed.
 - Filenames are sanitized, so an upload cannot write outside the uploads folder.
+- The model key is written to `agent_settings.json` with `chmod 600`. It is
+  never returned to the browser, never logged, and only ever sent to the
+  provider you selected.
+- The app writes to exactly two config files, both listed above, both with a
+  backup. It does not edit anything else, and it does not install Node or
+  Python — if those are missing it tells you where to get them.
 - The agent has the tools you would expect it to have (`terminal`,
   `file_editor`, `task_tracker`) and it runs on your machine with your
   permissions. Treat it like running any local script.

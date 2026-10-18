@@ -138,14 +138,57 @@ class LlmResolutionTests(unittest.TestCase):
 
 class BackendStartTests(unittest.TestCase):
     def test_start_reports_missing_canvas(self):
-        original = app.has_agent_canvas
-        app.has_agent_canvas = lambda: False
+        original_probe = app.probe_backend
+        original_find = app.find_agent_canvas
+        app.probe_backend = lambda: (False, "not running")
+        app.find_agent_canvas = lambda: None
         try:
             ok, detail = app.start_backend()
             self.assertFalse(ok)
             self.assertIn("agent-canvas", detail)
         finally:
-            app.has_agent_canvas = original
+            app.probe_backend = original_probe
+            app.find_agent_canvas = original_find
+
+    def test_does_not_start_a_second_instance(self):
+        """A healthy backend must be reused, never duplicated.
+
+        Regression test: start_backend used to launch unconditionally, so a
+        second agent-canvas failed on its fixed internal ports (18000/18001)
+        and the app reported a start failure while a working backend was up.
+        """
+        calls = []
+        original_probe = app.probe_backend
+        original_find = app.find_agent_canvas
+        original_popen = app.subprocess.Popen
+        app.probe_backend = lambda: (True, "running")
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        app.subprocess.Popen = lambda *a, **k: calls.append(a)
+        try:
+            ok, detail = app.start_backend()
+            self.assertTrue(ok)
+            self.assertIn("already", detail)
+            self.assertEqual(calls, [], "must not spawn a second agent-canvas")
+        finally:
+            app.probe_backend = original_probe
+            app.find_agent_canvas = original_find
+            app.subprocess.Popen = original_popen
+
+    def test_reports_a_port_held_by_something_unhealthy(self):
+        original_probe = app.probe_backend
+        original_find = app.find_agent_canvas
+        original_inuse = app.port_in_use
+        app.probe_backend = lambda: (False, "not running")
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        app.port_in_use = lambda p: True
+        try:
+            ok, detail = app.start_backend()
+            self.assertFalse(ok)
+            self.assertIn("in use", detail)
+        finally:
+            app.probe_backend = original_probe
+            app.find_agent_canvas = original_find
+            app.port_in_use = original_inuse
 
 
 class PageTests(unittest.TestCase):
@@ -380,6 +423,247 @@ class StartupTests(unittest.TestCase):
         self.assertLess(autostart_at, serve_at,
                         "autostart must be defined before the serve loop, "
                         "and run on its own thread")
+
+
+class UefnConfigTests(unittest.TestCase):
+    """The INI writer must be surgical: UEFN's prefs file holds everything else
+    the user has set, and a bad write there is worse than no write."""
+
+    SECTION = app.MCP_INI_SECTION
+
+    def test_adds_section_to_empty_file(self):
+        text, changed = app.set_ini_keys("", self.SECTION, {"bAutoStartServer": "True"})
+        self.assertTrue(changed)
+        self.assertIn(self.SECTION, text)
+        self.assertIn("bAutoStartServer=True", text)
+
+    def test_flips_existing_false_to_true(self):
+        original = f"{self.SECTION}\nbAutoStartServer=False\nServerPortNumber=8000\n"
+        text, changed = app.set_ini_keys(
+            original, self.SECTION, {"bAutoStartServer": "True"})
+        self.assertTrue(changed)
+        self.assertIn("bAutoStartServer=True", text)
+        self.assertNotIn("bAutoStartServer=False", text)
+
+    def test_is_idempotent(self):
+        original = f"{self.SECTION}\nbAutoStartServer=True\n"
+        _, changed = app.set_ini_keys(original, self.SECTION, {"bAutoStartServer": "True"})
+        self.assertFalse(changed)
+
+    def test_preserves_other_sections_and_keys(self):
+        original = (
+            "[/Script/UnrealEd.SomethingElse]\nKeepMe=1\n\n"
+            f"{self.SECTION}\nbAutoStartServer=False\n\n"
+            "[/Script/ValkyrieEditor.ValkyrieEditorConfig]\nOther=2\n"
+        )
+        text, _ = app.set_ini_keys(original, self.SECTION, {"bAutoStartServer": "True"})
+        self.assertIn("KeepMe=1", text)
+        self.assertIn("Other=2", text)
+        self.assertIn("bAutoStartServer=True", text)
+
+    def test_does_not_touch_a_same_named_key_in_another_section(self):
+        original = (
+            "[/Script/Other.Settings]\nbAutoStartServer=False\n\n"
+            f"{self.SECTION}\nbAutoStartServer=False\n"
+        )
+        text, _ = app.set_ini_keys(original, self.SECTION, {"bAutoStartServer": "True"})
+        # The first section's value must survive untouched.
+        self.assertIn("[/Script/Other.Settings]\nbAutoStartServer=False", text)
+        self.assertIn("bAutoStartServer=True", text)
+
+    def test_configure_writes_and_backs_up(self):
+        ini = os.path.join(self.tmp, "EditorPerProjectUserSettings.ini")
+        with open(ini, "w", encoding="utf-8") as fh:
+            fh.write("[Unrelated]\nx=1\n")
+        original = app.uefn_ini_path
+        app.uefn_ini_path = lambda: ini
+        try:
+            ok, detail = app.configure_uefn_autostart()
+            self.assertTrue(ok, detail)
+            self.assertTrue(os.path.exists(ini + ".uefn-link.bak"))
+            with open(ini, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertIn("bAutoStartServer=True", body)
+            self.assertIn("[Unrelated]", body)
+        finally:
+            app.uefn_ini_path = original
+
+    def test_configure_reports_missing_file(self):
+        original = app.uefn_ini_path
+        app.uefn_ini_path = lambda: os.path.join(self.tmp, "nope.ini")
+        try:
+            ok, detail = app.configure_uefn_autostart()
+            self.assertFalse(ok)
+            self.assertIn("not found", detail)
+        finally:
+            app.uefn_ini_path = original
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class ProjectFlagTests(unittest.TestCase):
+    """The .uefnproject edit must be additive and reversible."""
+
+    def _make_project(self, body):
+        root = tempfile.mkdtemp()
+        path = os.path.join(root, ".uefnproject")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(body, fh)
+        return root, path
+
+    def test_sets_both_beta_flags(self):
+        root, path = self._make_project({"dataSets": {}})
+        try:
+            ok, detail = app.enable_project_beta_flags(root)
+            self.assertTrue(ok, detail)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            exp = data["dataSets"]["experimental"]
+            self.assertTrue(exp["pythonExperimental"]["bEnablePythonForProject"])
+            self.assertTrue(exp["toolsets"]["bEnableToolsetsForProject"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_preserves_unrelated_project_data(self):
+        root, path = self._make_project({
+            "dataSets": {"other": {"keep": "me"}}, "topLevel": [1, 2, 3]})
+        try:
+            app.enable_project_beta_flags(root)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.assertEqual(data["dataSets"]["other"], {"keep": "me"})
+            self.assertEqual(data["topLevel"], [1, 2, 3])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_second_run_is_a_no_op(self):
+        root, _ = self._make_project({"dataSets": {}})
+        try:
+            app.enable_project_beta_flags(root)
+            ok, detail = app.enable_project_beta_flags(root)
+            self.assertTrue(ok)
+            self.assertIn("already", detail)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_bad_json_is_reported_not_raised(self):
+        root = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(root, ".uefnproject"), "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            ok, detail = app.enable_project_beta_flags(root)
+            self.assertFalse(ok)
+            self.assertIn("could not read", detail)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class LlmSaveTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.original = app.AGENT_SETTINGS_PATH
+        app.AGENT_SETTINGS_PATH = os.path.join(self.tmp, "agent_settings.json")
+
+    def tearDown(self):
+        app.AGENT_SETTINGS_PATH = self.original
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_saved_key_is_then_resolved(self):
+        ok, _ = app.save_llm_config("anthropic/claude-sonnet-4-5-20250929", "sk-abc", "https://api.anthropic.com")
+        self.assertTrue(ok)
+        llm = app.resolve_llm()
+        self.assertEqual(llm["api_key"], "sk-abc")
+        self.assertEqual(llm["model"], "anthropic/claude-sonnet-4-5-20250929")
+
+    def test_key_file_is_owner_only(self):
+        app.save_llm_config("m", "sk-secret", "")
+        mode = os.stat(app.AGENT_SETTINGS_PATH).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_refuses_empty_key(self):
+        ok, detail = app.save_llm_config("m", "  ", "")
+        self.assertFalse(ok)
+        self.assertIn("key", detail)
+
+    def test_preserves_other_settings_in_the_file(self):
+        with open(app.AGENT_SETTINGS_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"llm": {"model": "old"}, "other": {"keep": True}}, fh)
+        app.save_llm_config("new/model", "sk-new", "")
+        with open(app.AGENT_SETTINGS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["other"], {"keep": True})
+        self.assertEqual(data["llm"]["model"], "new/model")
+
+
+class FixAllTests(unittest.TestCase):
+    """fix-all must keep going after a failure so the user sees every problem,
+    and must never claim success while the credential is missing."""
+
+    def test_reports_manual_step_when_no_key(self):
+        tmp = tempfile.mkdtemp()
+        patches = {
+            "install_backend_dependencies": lambda progress=None: (True, "installed"),
+            "start_backend": lambda port=None: (True, "started"),
+            "configure_uefn_autostart": lambda: (True, "ini ok"),
+            "enable_project_beta_flags": lambda project=None: (True, "flags ok"),
+            "probe_uefn": lambda url: (True, "connected"),
+            "llm_status": lambda: (False, "no key"),
+            "WORKSPACE_DIR": tmp,
+        }
+        originals = {k: getattr(app, k) for k in patches}
+        for k, v in patches.items():
+            setattr(app, k, v)
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
+            port = server.server_address[1]
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/fix-all", method="POST", data=b"")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode())
+            server.shutdown()
+            server.server_close()
+            self.assertFalse(body["ok"])
+            self.assertIn("model credential", body["needs"])
+            manual = [s for s in body["steps"] if s["step"] == "model credential"][0]
+            self.assertTrue(manual["manual"])
+            # Every other step still ran and reported.
+            self.assertGreaterEqual(len(body["steps"]), 6)
+        finally:
+            for k, v in originals.items():
+                setattr(app, k, v)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class StatusPayloadTests(unittest.TestCase):
+    def test_status_exposes_env_and_presets(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=15) as r:
+                body = json.loads(r.read().decode())
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertIn("env", body)
+        self.assertIn("uefn_setup", body)
+        self.assertIn("presets", body)
+        self.assertIn("node", body["env"])
+        self.assertTrue(body["presets"])
+
+    def test_page_has_the_fix_controls(self):
+        page = app.build_page()
+        self.assertIn("Fix everything", page)
+        self.assertIn("/api/fix-all", page)
+        self.assertIn("/api/llm/save", page)
+        self.assertIn("/api/backend/install", page)
+        self.assertIn("__APP_NAME__", app.PAGE)  # placeholder is in the template
+        self.assertNotIn("__APP_NAME__", page)   # and substituted in the output
 
 
 if __name__ == "__main__":

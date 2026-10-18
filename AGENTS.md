@@ -117,8 +117,17 @@ These cost real debugging time to establish. Do not re-derive them.
 - The local backend is `agent-canvas --backend-only` from
   `@openhands/agent-canvas` (npm). It serves the agent-server REST API.
 - It defaults to port **8000**, which collides with UEFN's own MCP server.
-  The app uses **3000** and adapts if that is busy. Never point the backend at
-  8000.
+  The app uses **3000**. Never point the backend at 8000.
+- **Only one agent-canvas can run per machine.** Besides its ingress port it
+  binds fixed internal ports (agent-server **18000**, automation **18001**), so a
+  second launch dies with `Cannot start: the following ports are already in use`
+  *regardless of which ingress port you pass*. `start_backend` therefore probes
+  first and returns `"already running"` instead of spawning. A busy ingress port
+  is reported, not worked around — retrying on another port cannot help.
+- `npm install -g` needs a writable global prefix. On Linux CI that is often
+  `/usr/local` (not writable); on Windows it is `%APPDATA%\npm` (writable). The
+  installer checks `os.access(prefix, os.W_OK)` and, if it fails, prints the
+  `npm config set prefix` fix rather than npm's raw EACCES wall.
 - `POST /api/conversations` **requires** `agent.llm` (model, api_key, base_url).
   Omitting it is HTTP 422. Omitting `agent` entirely is also 422.
 - The session key at `~/.openhands/agent-canvas/api-key.txt` authorizes the
@@ -130,4 +139,30 @@ These cost real debugging time to establish. Do not re-derive them.
   credits. A `201` conversation that errors on run is almost always this.
 - The app therefore resolves the LLM key *before* starting a conversation and
   refuses with a clear message if there is none, instead of failing later.
+
+## UEFN editor settings, verified facts
+
+What `POST /api/uefn/fix` writes, and why it is safe to write.
+
+- UEFN's MCP server default is port **8000**, path **`/mcp`**.
+- Editor Preferences → Model Context Protocol persists to
+  `%LOCALAPPDATA%\UnrealEditorFortnite\Saved\Config\WindowsEditor\EditorPerProjectUserSettings.ini`
+  under `[/Script/ModelContextProtocol.ModelContextProtocolSettings]`, keys
+  `bAutoStartServer`, `ServerPortNumber`, `ServerUrlPath`. (On Linux/macOS the
+  same path sits under `~/.config/`.) `set_ini_keys` edits only the named
+  section and named keys, so unrelated prefs survive byte for byte; there is a
+  test asserting a same-named key in another section is untouched.
+- `.uefnproject` is JSON. The beta flags live at
+  `dataSets.experimental.pythonExperimental.bEnablePythonForProject` and
+  `dataSets.experimental.toolsets.bEnableToolsetsForProject`.
+- Both writers back up to `<file>.uefn-link.bak` before the first change and are
+  idempotent, so pressing Fix twice is harmless.
+- **These edits are necessary but not always sufficient.** Epic gates "UEFN MCP
+  Toolsets" behind account-level **Beta Access**, and the validation layer
+  ignores manual INI overrides without it. Symptom: no Beta Access section in
+  Project Settings, and `Python disabled via CVar
+  'Engine.Python.IsEnabledByDefault'` in the Output Log. Do not try to defeat
+  that gate in code — report it. The app's fix-all says so explicitly rather
+  than claiming success.
+
 
