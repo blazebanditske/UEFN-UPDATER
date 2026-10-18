@@ -579,6 +579,7 @@ class LlmSaveTests(unittest.TestCase):
         self.assertEqual(llm["api_key"], "sk-abc")
         self.assertEqual(llm["model"], "anthropic/claude-sonnet-4-5-20250929")
 
+    @unittest.skipIf(os.name == "nt", "Windows has no POSIX mode bits")
     def test_key_file_is_owner_only(self):
         app.save_llm_config("m", "sk-secret", "")
         mode = os.stat(app.AGENT_SETTINGS_PATH).st_mode & 0o777
