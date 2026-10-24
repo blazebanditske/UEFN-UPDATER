@@ -222,3 +222,7 @@ When you add a failure path, add its code to `GUIDES` and to the expected set in
   tells the user to run npm names Command Prompt explicitly. Do not suggest
   Set-ExecutionPolicy as the fix: it weakens a machine-wide security setting to
   work around a shell the app does not need.
+- start_backend's wait is BACKEND_START_TIMEOUT (module constant, default 90s).
+  Keep it injectable: tests set it to 0.1s, otherwise the spawn test sleeps the
+  full 90s and the suite triples in runtime. When you change the wait, change the
+  constant, not a literal buried in the loop.
