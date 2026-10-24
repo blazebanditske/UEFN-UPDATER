@@ -304,6 +304,7 @@ is exposed to the network.
 | `POST /api/fix-all` | runs every automatic repair in order and reports each step |
 | `POST /api/backend/install` | `npm install -g @openhands/agent-canvas` |
 | `POST /api/backend/start` | starts `agent-canvas --backend-only --port 3010` and waits for it |
+| `POST /api/backend/use` | saves which backend to use: automatic, this app's own, or a custom URL |
 | `POST /api/uefn/fix` | writes UEFN's auto-start setting and the project beta flags |
 | `POST /api/llm/save` | saves a model key to `agent_settings.json` |
 | `POST /api/upload` | saves a file to `~/UEFN-Agent/uploads/` |

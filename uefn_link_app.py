@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "UEFN Link"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
 DEFAULT_APP_PORT = 8765
 UEFN_MCP_URL = os.environ.get("UEFN_MCP_URL", "http://127.0.0.1:8000/mcp")
 # UEFN's embedded MCP server owns 8000 by default. The agent backend must not
@@ -44,6 +44,24 @@ BACKEND_URL = os.environ.get(
     "LOCAL_AGENT_SERVER_URL", f"http://127.0.0.1:{DEFAULT_BACKEND_PORT}"
 )
 CLOUD_CANVAS_URL = "https://app.all-hands.dev/canvas/conversations"
+
+# agent-canvas binds agent-server and automation to FIXED internal ports, and
+# refuses to start if either is taken -- whatever ingress port it is given. An
+# already-running agent-canvas therefore blocks this app's own launch on
+# 18000/18001, not on 3010. These are the ports to check for that condition.
+# (Verified in @openhands/agent-canvas 1.33.0: config/defaults.json pins
+# ports.agentServer/automation, and scripts/dev-with-automation.mjs calls
+# assertPortsFree before starting anything.)
+AGENT_CANVAS_INTERNAL_PORTS = (18000, 18001)
+
+# Where a running backend might be listening. The app probes these to adopt one
+# instead of spawning a second agent-canvas that cannot start. 3010 is this
+# app's own default, 3000 is agent-canvas's documented local UI port, and 8000
+# is agent-canvas's bare default -- which UEFN's MCP server also uses, so a
+# match there is only trusted when /server_info identifies it as a backend.
+# 18000 is the agent-server's own port, reachable directly when a stack is up
+# but its ingress is not; it serves the same /server_info and /api routes.
+BACKEND_CANDIDATE_PORTS = (DEFAULT_BACKEND_PORT, 3000, 8000, 18000)
 
 HOME_DIR = os.path.expanduser("~")
 # Windows is the only platform UEFN ships on, so it is the platform that
@@ -222,18 +240,66 @@ def backend_key() -> str | None:
     return None
 
 
-def probe_backend() -> tuple[bool, str]:
+def probe_backend(url: str | None = None, timeout: float = 4) -> tuple[bool, str]:
+    """Is an agent-server answering at `url` (default BACKEND_URL)?
+
+    /server_info is the discriminator, and the reason a backend can be told
+    apart from UEFN's MCP server even when both sit on port 8000: the editor
+    never answers this route with 200.
+    """
     key = backend_key()
     status, _ = http_json(
-        f"{BACKEND_URL}/server_info",
+        f"{url or BACKEND_URL}/server_info",
         headers={"X-Session-API-Key": key} if key else {},
-        timeout=4,
+        timeout=timeout,
     )
     if status == 200:
         return True, "running"
     if status == 401:
         return False, "running but key rejected"
     return False, "not running"
+
+
+def discover_backend(ports=None, probe=None) -> dict | None:
+    """Find an agent backend already running on this machine.
+
+    This is the fix for the one-backend-per-machine rule. agent-canvas pins its
+    internal ports (18000/18001) and aborts if they are taken, so spawning a
+    second copy fails no matter what -- but a backend that is already up is
+    perfectly usable, because agent-canvas's ingress routes /server_info and
+    /api to the agent-server behind it. So the app looks before it launches.
+
+    A URL set through LOCAL_AGENT_SERVER_URL is never second-guessed: the user
+    said where the backend is, and guessing over that would be rude.
+    """
+    if os.environ.get("LOCAL_AGENT_SERVER_URL"):
+        return None
+
+    candidate_ports = ports if ports is not None else BACKEND_CANDIDATE_PORTS
+    check = probe or (lambda url: probe_backend(url, timeout=1.5))
+    for port in candidate_ports:
+        url = f"http://127.0.0.1:{port}"
+        if url.rstrip("/") == BACKEND_URL.rstrip("/"):
+            continue  # already covered by the direct probe
+        try:
+            ok, detail = check(url)
+        except Exception:
+            # A probe must never break the page, and a candidate we cannot
+            # reach is simply not a candidate.
+            continue
+        if ok:
+            return {"url": url, "port": port, "detail": detail}
+    return None
+
+
+def agent_canvas_running_elsewhere() -> bool:
+    """True when agent-canvas's fixed internal ports are held.
+
+    That means another agent-canvas (or something shaped like one) is up, and a
+    launch of ours cannot succeed -- so the app can say so immediately instead
+    of spawning a doomed process and waiting out the timeout.
+    """
+    return any(port_in_use(port) for port in AGENT_CANVAS_INTERNAL_PORTS)
 
 
 def which_any(*names) -> str | None:
@@ -365,6 +431,93 @@ def environment_report() -> dict:
         "uefn_project": find_uefn_project(),
         "platform": sys.platform,
     }
+
+
+# --- backend choice --------------------------------------------------------
+# Which backend the app should use, persisted so the answer survives a restart.
+# "auto" (default) probes for a running one, "own" always starts and uses this
+# app's port, and "custom" pins a URL the user typed.
+BACKEND_MODES = ("auto", "own", "custom")
+
+
+def backend_settings_path() -> str:
+    """Path to the saved backend choice.
+
+    A function, not a constant: WORKSPACE_DIR is reassigned by main() and by
+    tests, so resolving it at import time would read the wrong file.
+    """
+    return os.path.join(WORKSPACE_DIR, "backend.json")
+
+
+def load_backend_choice() -> dict:
+    """The saved backend choice, validated. Falls back to auto."""
+    try:
+        with open(backend_settings_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"mode": "auto", "url": ""}
+    if not isinstance(saved, dict):
+        return {"mode": "auto", "url": ""}
+    mode = saved.get("mode") if saved.get("mode") in BACKEND_MODES else "auto"
+    url = saved.get("url") if isinstance(saved.get("url"), str) else ""
+    if mode == "custom" and not url:
+        mode = "auto"
+    return {"mode": mode, "url": url}
+
+
+def save_backend_choice(mode: str, url: str = "") -> tuple[bool, str]:
+    """Persist the backend choice. Returns (ok, message)."""
+    if mode not in BACKEND_MODES:
+        return False, f"unknown mode: {mode}"
+    url = (url or "").strip()
+    if mode == "custom":
+        if not url:
+            return False, "a custom backend needs a URL"
+        if urlparse(url).scheme not in ("http", "https"):
+            return False, "the URL must start with http:// or https://"
+    try:
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        with open(backend_settings_path(), "w", encoding="utf-8") as handle:
+            json.dump({"mode": mode, "url": url}, handle, indent=2)
+    except OSError as exc:
+        return False, f"could not save the choice: {exc}"
+    return True, f"backend set to {mode}"
+
+
+def effective_backend_url() -> str:
+    """The backend URL the app should actually use, honoring the saved choice.
+
+    LOCAL_AGENT_SERVER_URL wins over everything: it is an explicit instruction
+    from whoever started the app, and silently overriding it would be wrong.
+    """
+    override = os.environ.get("LOCAL_AGENT_SERVER_URL")
+    if override:
+        return override
+    choice = load_backend_choice()
+    if choice["mode"] == "custom" and choice["url"]:
+        return choice["url"].rstrip("/")
+    if choice["mode"] == "auto":
+        found = discover_backend()
+        if found:
+            return found["url"]
+    return f"http://127.0.0.1:{DEFAULT_BACKEND_PORT}"
+
+
+def active_backend() -> tuple[bool, str, str]:
+    """Where the agent backend is, as (ok, detail, url).
+
+    One place for the "is it up, and where" question, so the status row and the
+    Start button can never disagree. Falls back to discovery in auto mode,
+    which is what lets the app use an agent-canvas the user started themselves.
+    """
+    ok, detail = probe_backend()
+    if ok:
+        return True, detail, BACKEND_URL
+    if load_backend_choice()["mode"] == "auto":
+        found = discover_backend()
+        if found:
+            return True, f"running on port {found['port']}", found["url"]
+    return False, detail, effective_backend_url()
 
 
 # --- failure guides --------------------------------------------------------
@@ -518,6 +671,19 @@ GUIDES = {
         "If you must start it by hand, run:  " + _START_CMD,
         done="The Agent backend row turns green.",
     ),
+    "backend_already_running": _guide(
+        "Another agent-canvas is already running",
+        "Only one agent-canvas can run at a time. It always claims the same two "
+        "internal ports (18000 and 18001), so a second copy cannot start — no "
+        "matter which port it is given.",
+        "You do not have to close it. This app can use the one that is already "
+        "running: press Fix everything, or set Backend to Automatic.",
+        "If you would rather run this app's own backend, close the other "
+        "agent-canvas first: end any agent-canvas process in Task Manager "
+        "(Ctrl+Shift+Esc), or stop the terminal running `agent-canvas`.",
+        "Then press Fix everything.",
+        done="The Agent backend row turns green.",
+    ),
     "uefn_ini_missing": _guide(
         "UEFN's settings file was not found",
         "Open UEFN once and let it finish loading a project.",
@@ -598,10 +764,14 @@ def backend_failure_code() -> str:
     """Why is the backend row red? Pick the guide that matches the machine.
 
     Distinguishes "not installed" from "installed but stopped", because the
-    repair is different and the app can tell them apart for free.
+    repair is different and the app can tell them apart for free. A held
+    internal port means a second copy cannot start at all, which has its own
+    repair (adopt it, or close it) rather than "press Fix".
     """
     if not find_agent_canvas():
         return "backend_missing"
+    if agent_canvas_running_elsewhere():
+        return "backend_already_running"
     return "backend_stopped"
 
 
@@ -1005,27 +1175,54 @@ def start_backend(port: int | None = None) -> dict:
 
     The editor's MCP server is loopback-only, so the agent has to run on this
     same machine. Returns as soon as the server responds, or after a timeout.
-    Starting when one is already healthy is a no-op, and a port held by an
-    unrelated process is reported rather than worked around, because
-    agent-canvas also claims fixed internal ports.
+
+    Three things this does before spawning anything, because a second
+    agent-canvas cannot start at all:
+
+    1. A healthy backend on the app's URL is reused.
+    2. In "auto" mode a backend already running elsewhere on the machine (a
+       full `agent-canvas` the user launched themselves, say) is adopted -- its
+       ingress serves the same API, so it is the backend, not a competitor.
+    3. If agent-canvas's fixed internal ports (18000/18001) are held, it says
+       so at once instead of spawning a process that is guaranteed to abort.
     """
     # Default to the port the app actually probes, so the process we spawn and
     # the URL we read can never disagree.
     port = backend_port() if port is None else port
 
-    # Already up? Do not start a second instance. agent-canvas also binds
-    # internal ports (agent-server 18000, automation 18001) that a running
-    # instance already holds, so a second launch fails no matter which ingress
-    # port it is given.
+    # Already up on our own URL? Do not start a second instance.
     ok, _ = probe_backend()
     if ok:
         return ok_result("already running")
+
+    # Someone else's backend, fully usable. Adopting it is the whole point:
+    # two agent-canvas processes cannot coexist, so the choice is this or
+    # nothing, and this one already works.
+    if load_backend_choice()["mode"] == "auto":
+        found = discover_backend()
+        if found:
+            return ok_result(
+                f"using the agent backend already running on port {found['port']}",
+                adopted_url=found["url"],
+            )
 
     canvas = find_agent_canvas()
     if not canvas:
         return fail_result(
             "backend_missing",
             "agent-canvas is not installed.",
+        )
+
+    if agent_canvas_running_elsewhere():
+        # 18000/18001 are held, so agent-canvas would abort on startup no
+        # matter which ingress port we pass. Reported immediately: spawning
+        # would only waste the start timeout to reach the same conclusion.
+        return fail_result(
+            "backend_already_running",
+            "an agent-canvas is already running (its internal ports "
+            f"{AGENT_CANVAS_INTERNAL_PORTS[0]}/{AGENT_CANVAS_INTERNAL_PORTS[1]} "
+            "are in use), but it is not answering on "
+            f"{BACKEND_URL}.",
         )
 
     if port_in_use(port):
@@ -1062,12 +1259,20 @@ def start_backend(port: int | None = None) -> dict:
             return ok_result("started")
         time.sleep(2)
 
-    # It died or hung. The common cause is a port already claimed by a
-    # hand-started agent-canvas (its default ingress is UEFN's own 8000), which
-    # names itself in the log. Read the log so the app can say which repair
-    # applies instead of a generic timeout.
+    # It died or hung. agent-canvas names the reason in the log: either its
+    # fixed internal ports (18000/18001) are held by another instance, or the
+    # ingress port is taken. Read this launch's output so the app can name the
+    # repair instead of reporting a generic timeout.
     tail = backend_log_since(log_path, log_offset)
-    if "already in use" in tail.lower():
+    lowered = tail.lower()
+    if "already in use" in lowered or "already be running" in lowered:
+        if any(str(p) in tail for p in AGENT_CANVAS_INTERNAL_PORTS):
+            return fail_result(
+                "backend_already_running",
+                f"agent-canvas could not start: its internal ports "
+                f"{AGENT_CANVAS_INTERNAL_PORTS[0]}/{AGENT_CANVAS_INTERNAL_PORTS[1]} "
+                f"are held by another agent-canvas (see {log_path}).",
+            )
         return fail_result(
             "backend_port_conflict",
             f"agent-canvas could not bind its ports — something is already "
@@ -1136,6 +1341,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self._backend_start()
         elif self.path == "/api/backend/install":
             self._backend_install()
+        elif self.path == "/api/backend/use":
+            self._backend_use()
         elif self.path == "/api/uefn/fix":
             self._uefn_fix()
         elif self.path == "/api/llm/save":
@@ -1165,7 +1372,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         probes = [
             ("uefn", lambda: probe_uefn(UEFN_MCP_URL)),
-            ("backend", probe_backend),
+            ("backend", active_backend),
             ("llm", llm_status),
         ]
         workers = [threading.Thread(target=run, args=(n, f)) for n, f in probes]
@@ -1175,16 +1382,32 @@ class AppHandler(BaseHTTPRequestHandler):
             worker.join()
 
         uefn_ok, uefn_msg = results["uefn"]
-        back_ok, back_msg = results["backend"]
         llm_ok, llm_msg = results["llm"]
+
+        # active_backend() probes the configured URL and, only when that is
+        # dark, looks for a backend running elsewhere -- so the happy path costs
+        # one probe and the page's 10s poll stays cheap. It runs on the pool
+        # above for the same reason the others do: a dead service must not stall
+        # the whole page.
+        back_ok, back_msg, active_url = results["backend"]
+        choice = load_backend_choice()
+        found = (
+            {"url": active_url, "port": urlparse(active_url).port}
+            if back_ok and active_url.rstrip("/") != BACKEND_URL.rstrip("/")
+            else None
+        )
+
         self._json(200, {
             "uefn": {
                 "ok": uefn_ok, "detail": uefn_msg, "url": UEFN_MCP_URL,
                 "guide": None if uefn_ok else guide_for("uefn_not_connected"),
             },
             "backend": {
-                "ok": back_ok, "detail": back_msg, "url": BACKEND_URL,
+                "ok": back_ok, "detail": back_msg, "url": active_url,
                 "guide": None if back_ok else guide_for(backend_failure_code()),
+                "mode": choice["mode"],
+                "custom_url": choice["url"],
+                "discovered": found,
             },
             "llm": {
                 "ok": llm_ok, "detail": llm_msg,
@@ -1206,6 +1429,24 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _backend_install(self):
         self._json(200, install_backend_dependencies())
+
+    def _backend_use(self):
+        """Save which backend to use: auto, own, or a custom URL.
+
+        The choice is persisted, so a user who has to point the app at an
+        existing backend does it once rather than on every launch.
+        """
+        body = self._read_body() or b"{}"
+        try:
+            request = json.loads(body.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return self._json(400, {"error": "malformed request"})
+        mode = (request.get("mode") or "auto").strip()
+        url = (request.get("url") or "").strip()
+        ok, detail = save_backend_choice(mode, url)
+        if not ok:
+            return self._json(400, {"error": detail})
+        self._json(200, {"ok": True, "detail": detail, "mode": mode, "url": url})
 
     def _uefn_fix(self):
         results = []
@@ -1355,7 +1596,7 @@ class AppHandler(BaseHTTPRequestHandler):
                        "and UEFN MCP Toolsets, then restart the editor.",
             })
 
-        back_ok, back_detail = probe_backend()
+        back_ok, back_detail, back_url = active_backend()
         if not back_ok:
             return self._json(400, {
                 "error": f"The agent backend is not available ({back_detail}).",
@@ -1402,7 +1643,7 @@ class AppHandler(BaseHTTPRequestHandler):
             },
         }
         status, result = http_json(
-            f"{BACKEND_URL}/api/conversations",
+            f"{back_url}/api/conversations",
             payload,
             {"X-Session-API-Key": backend_key() or ""},
             timeout=60,
@@ -1414,7 +1655,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self._json(200, {
             "ok": True,
             "id": conversation_id,
-            "url": f"{BACKEND_URL}/conversations/{conversation_id}",
+            "url": f"{back_url}/conversations/{conversation_id}",
             "uploads_used": uploads,
         })
 
@@ -1488,7 +1729,7 @@ border-radius:8px;padding:8px;font:inherit;width:100%}
 
 <div class="card"><h2>Status</h2>
 <div class="row"><span class="dot" id="d-uefn"></span><span class="label">Unreal Editor for Fortnite</span><span class="meta" id="m-uefn">checking…</span><button class="ghost sm" id="f-uefn" onclick="fixUefn()">Fix</button></div>
-<div class="row"><span class="dot" id="d-back"></span><span class="label">Agent backend (this machine)</span><span class="meta" id="m-back">checking…</span><button class="ghost sm" id="f-back" onclick="fixBackend()">Fix</button></div>
+<div class="row"><span class="dot" id="d-back"></span><span class="label">Agent backend (this machine)</span><span class="meta" id="m-back">checking…</span><button class="ghost sm" id="f-back" onclick="fixBackend()">Fix</button><button class="ghost sm" onclick="toggleBackendForm()">Choose</button></div>
 <div class="row"><span class="dot" id="d-llm"></span><span class="label">Model</span><span class="meta" id="m-llm">checking…</span><button class="ghost sm" id="f-llm" onclick="toggleKeyForm()">Set key</button></div>
 <div class="actions"><button onclick="fixAll()" id="btn-fixall">Fix everything</button>
 <button class="ghost" onclick="refresh()">Re-check</button>
@@ -1496,6 +1737,20 @@ border-radius:8px;padding:8px;font:inherit;width:100%}
 <div class="note" id="workspace"></div>
 <div id="statusguides"></div>
 <div class="note" id="fixlog"></div>
+</div>
+
+<div class="card" id="backcard" style="display:none"><h2>Agent backend</h2>
+<div class="note">agent-canvas can only run one copy at a time — it always claims the same two internal ports (18000 and 18001), so a second copy cannot start no matter which port it is given. Pick how this app should find its backend.</div>
+<div class="actions" style="margin-top:10px">
+<select id="back-mode" onchange="onBackendMode()">
+<option value="auto">Automatic — use any backend already running (recommended)</option>
+<option value="own">This app's own — start one on port __BACKEND_PORT__</option>
+<option value="custom">Another URL — I will type it</option>
+</select></div>
+<input id="back-url" placeholder="http://127.0.0.1:3000" style="display:none;width:100%;margin-top:8px;padding:9px;border-radius:8px;border:1px solid var(--line);background:#0f1216;color:var(--fg)">
+<div class="actions"><button onclick="saveBackendChoice()">Save</button>
+<button class="ghost" onclick="toggleBackendForm()">Close</button></div>
+<div class="note" id="backhint"></div>
 </div>
 
 <div class="card" id="keycard" style="display:none"><h2>Model credential</h2>
@@ -1543,13 +1798,14 @@ async function refresh(){
     $('m-uefn').textContent=s.uefn.ok?'connected':s.uefn.detail;
     $('f-uefn').style.display=s.uefn.ok?'none':'';
     setDot($('d-back'),s.backend.ok?'ok':'bad');
-    $('m-back').textContent=s.backend.ok?'running':s.backend.detail;
+    $('m-back').textContent=s.backend.ok?'running'+((s.backend.discovered)?' (port '+s.backend.discovered.port+')':''):s.backend.detail;
     $('f-back').style.display=s.backend.ok?'none':'';
     setDot($('d-llm'),s.llm.ok?'ok':'bad');
     $('m-llm').textContent=s.llm.detail;
     $('f-llm').style.display=s.llm.ok?'none':'';
     $('btn-reg').style.display=s.cli?'':'none';
     $('workspace').textContent='Workspace: '+s.workspace+'  ·  v'+s.version;
+    syncBackendForm(s.backend);
     renderStatusGuides(s);
     if(!presets.length&&s.presets){presets=s.presets;fillPresets()}
     renderFiles(s.uploads);
@@ -1585,6 +1841,44 @@ function applyPreset(){
 function toggleKeyForm(){
   const c=$('keycard');
   c.style.display=c.style.display==='none'?'':'none';
+}
+function toggleBackendForm(){
+  const c=$('backcard');
+  c.style.display=c.style.display==='none'?'':'none';
+}
+// Keep the form honest about what the app is actually doing, without
+// stomping on a choice the user is part-way through making.
+function syncBackendForm(back){
+  if(!back)return;
+  const sel=$('back-mode');
+  if(!sel.dataset.touched){sel.value=back.mode||'auto'}
+  $('back-url').value=back.custom_url||'';
+  onBackendMode();
+  const hint=$('backhint');
+  if(back.discovered){
+    hint.textContent='Using the backend already running on port '+back.discovered.port+'.';
+  }else if(back.ok){
+    hint.textContent='Using '+back.url+'.';
+  }else{
+    hint.textContent='No backend found. Automatic will use one if you start agent-canvas yourself.';
+  }
+}
+function onBackendMode(){
+  $('back-url').style.display=$('back-mode').value==='custom'?'':'none';
+}
+async function saveBackendChoice(){
+  const mode=$('back-mode').value,url=$('back-url').value.trim();
+  $('back-mode').dataset.touched='1';
+  if(mode==='custom'&&!url){show('err','Type the backend URL first, e.g. http://127.0.0.1:3000');return}
+  try{
+    const r=await (await fetch('/api/backend/use',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode,url})})).json();
+    if(r.ok){show('ok','Backend set. Checking…');toggleBackendForm()}
+    else{show('err',r.error||'Could not save the choice.')}
+  }catch(e){show('err','Could not save the choice: '+e)}
+  delete $('back-mode').dataset.touched;
+  refresh();
 }
 function logStep(name,ok,detail,guide){
   const el=$('fixlog');
@@ -1733,7 +2027,11 @@ refresh();setInterval(refresh,10000);
 
 
 def build_page() -> str:
-    return PAGE.replace("__APP_NAME__", APP_NAME).replace("__BACKEND__", BACKEND_URL)
+    return (
+        PAGE.replace("__APP_NAME__", APP_NAME)
+        .replace("__BACKEND__", effective_backend_url())
+        .replace("__BACKEND_PORT__", str(DEFAULT_BACKEND_PORT))
+    )
 
 
 def main(argv=None) -> int:
@@ -1759,14 +2057,18 @@ def main(argv=None) -> int:
     url = f"http://127.0.0.1:{port}"
 
     uefn_ok, uefn_detail = probe_uefn(UEFN_MCP_URL)
-    back_ok, back_detail = probe_backend()
+    back_ok, back_detail, back_url = active_backend()
     llm_ok, llm_detail = llm_status()
 
     print(f"{APP_NAME} {APP_VERSION}")
     print(f"  app        {url}")
     print(f"  workspace  {WORKSPACE_DIR}")
     print(f"  uefn       {'connected' if uefn_ok else 'NOT reachable (' + uefn_detail + ')'}")
-    print(f"  backend    {'running' if back_ok else 'NOT running (' + back_detail + ')'}")
+    if back_ok:
+        note = "" if back_url == BACKEND_URL else f"  [{back_url}]"
+        print(f"  backend    running{note}")
+    else:
+        print(f"  backend    NOT running ({back_detail})")
     print(f"  model      {llm_detail}")
     print()
 
@@ -1778,6 +2080,12 @@ def main(argv=None) -> int:
     if not llm_ok:
         print("  No LLM key found. Run 'openhands login' to use your OpenHands")
         print("  Cloud account, or set LLM_MODEL and LLM_API_KEY.")
+        print()
+
+    if back_ok and back_url != BACKEND_URL:
+        print(f"  Using the agent backend already running at {back_url}.")
+        print("  agent-canvas allows only one copy per machine, so this app")
+        print("  reuses it rather than starting a second one.")
         print()
 
     print("  Leave this window open. Press Ctrl+C to quit.")

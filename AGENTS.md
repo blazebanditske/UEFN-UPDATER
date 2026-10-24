@@ -121,9 +121,36 @@ These cost real debugging time to establish. Do not re-derive them.
 - **Only one agent-canvas can run per machine.** Besides its ingress port it
   binds fixed internal ports (agent-server **18000**, automation **18001**), so a
   second launch dies with `Cannot start: the following ports are already in use`
-  *regardless of which ingress port you pass*. `start_backend` therefore probes
-  first and returns `"already running"` instead of spawning. A busy ingress port
-  is reported, not worked around — retrying on another port cannot help.
+  *regardless of which ingress port you pass*. Verified against
+  `@openhands/agent-canvas` 1.33.0: `config/defaults.json` pins those ports and
+  `scripts/dev-with-automation.mjs` calls `assertPortsFree` before starting
+  anything. The constants are `AGENT_CANVAS_INTERNAL_PORTS`.
+- **A running agent-canvas is adoptable, not a competitor.** Its ingress routes
+  `/server_info` and `/api` to the agent-server behind it (same routes the app
+  already uses), so a full `agent-canvas` the user started themselves IS a
+  usable backend. `start_backend` therefore probes for one and returns
+  `adopted_url` instead of spawning. This is the fix for the reported "Agent
+  backend (this machine) will not run" failure, which was always a second copy
+  aborting on 18000/18001. Do not "fix" it by killing the user's process.
+- **`backend_already_running` is distinct from `backend_port_busy`.** Held
+  internal ports mean no second copy can start at all — reported immediately,
+  with no spawn and no wait. A held ingress port alone is `backend_port_busy`.
+  `agent_canvas_running_elsewhere()` is the test for the former, and it gates
+  `backend_failure_code()` so the status row shows the right guide.
+- **Discovery is opt-in per call and defers to an explicit URL.** `discover_backend()`
+  probes `BACKEND_CANDIDATE_PORTS` (3010, 3000, 8000) but returns None when
+  `LOCAL_AGENT_SERVER_URL` is set: an explicit instruction is not a hint. It
+  also skips the configured URL, which the direct probe already covers. A probe
+  that raises is swallowed — a candidate we cannot reach is simply not one.
+- **Backend choice is persisted in `backend.json`** under the workspace, via
+  `load_backend_choice()`/`save_backend_choice()`. Modes are `auto` (adopt or
+  start), `own` (always start on 3010), `custom` (pin a URL). The path is a
+  *function*, `backend_settings_path()`, because `WORKSPACE_DIR` is reassigned
+  by `main()` and by tests — a module constant would read the wrong file.
+- **`active_backend()` is the single source of "is it up, and where".** The
+  status row and `/api/start` both call it, so they cannot disagree. It runs on
+  the status thread pool (see the cost rules below): it is cheap on the happy
+  path because discovery only runs when the configured URL is dark.
 - `npm install -g` needs a writable global prefix. On Linux CI that is often
   `/usr/local` (not writable); on Windows it is `%APPDATA%\npm` (writable). The
   installer checks `os.access(prefix, os.W_OK)` and, if it fails, prints the

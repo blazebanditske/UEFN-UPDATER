@@ -179,9 +179,11 @@ class BackendStartTests(unittest.TestCase):
         original_probe = app.probe_backend
         original_find = app.find_agent_canvas
         original_inuse = app.port_in_use
-        app.probe_backend = lambda: (False, "not running")
+        app.probe_backend = lambda *a, **k: (False, "not running")
         app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
-        app.port_in_use = lambda p: True
+        # The backend port is held; agent-canvas's internal ports are free, so
+        # this is a busy ingress port, not another agent-canvas.
+        app.port_in_use = lambda p: p == app.backend_port()
         try:
             result = app.start_backend()
             self.assertFalse(result["ok"])
@@ -191,6 +193,40 @@ class BackendStartTests(unittest.TestCase):
             app.probe_backend = original_probe
             app.find_agent_canvas = original_find
             app.port_in_use = original_inuse
+
+    def test_reports_another_agent_canvas_holding_internal_ports(self):
+        """A held internal port means no second copy can start at all.
+
+        This is the reported "Agent backend (this machine) will not run"
+        failure: agent-canvas pins 18000/18001, so a second launch aborts
+        whatever ingress port it is given. The app must say so at once rather
+        than spawn a doomed process and wait out the timeout.
+        """
+        original_probe = app.probe_backend
+        original_find = app.find_agent_canvas
+        original_inuse = app.port_in_use
+        original_popen = app.subprocess.Popen
+        original_choice = app.load_backend_choice
+        spawned = []
+
+        app.probe_backend = lambda *a, **k: (False, "not running")
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        # An agent-canvas is up: its internal ports are held.
+        app.port_in_use = lambda p: p in app.AGENT_CANVAS_INTERNAL_PORTS
+        app.load_backend_choice = lambda: {"mode": "own", "url": ""}
+        app.subprocess.Popen = lambda *a, **k: spawned.append(a)
+        try:
+            result = app.start_backend()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "backend_already_running")
+            self.assertEqual(spawned, [], "must not spawn a doomed second copy")
+            self.assertTrue(result["guide"]["steps"])
+        finally:
+            app.probe_backend = original_probe
+            app.find_agent_canvas = original_find
+            app.port_in_use = original_inuse
+            app.subprocess.Popen = original_popen
+            app.load_backend_choice = original_choice
 
 
 class WindowsCommandResolutionTests(unittest.TestCase):
@@ -1149,6 +1185,214 @@ class FixAllTests(unittest.TestCase):
         self.assertTrue(body["ok"])
         for step in body["steps"]:
             self.assertIsNone(step["guide"], step["step"])
+
+
+class BackendChoiceTests(unittest.TestCase):
+    """The one-backend-per-machine rule, and how the app works around it.
+
+    agent-canvas pins its internal ports (18000/18001) and refuses to start a
+    second copy, so a user who already runs agent-canvas cannot start this
+    app's backend at all. The fix is to find and reuse the running one, or to
+    let the user say which backend to use. These tests drive real sockets.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.original_workspace = app.WORKSPACE_DIR
+        app.WORKSPACE_DIR = self.tmp
+
+    def tearDown(self):
+        app.WORKSPACE_DIR = self.original_workspace
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_discovery_finds_a_backend_on_a_candidate_port(self):
+        with FakeBackend() as backend:
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            try:
+                found = app.discover_backend(ports=[backend.port])
+            finally:
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+        self.assertIsNotNone(found, "a live backend must be discovered")
+        self.assertEqual(found["port"], backend.port)
+        self.assertEqual(found["url"], backend.url)
+
+    def test_discovery_ignores_closed_ports(self):
+        """A port nobody is listening on is simply not a candidate."""
+        free = app.free_port(0)
+        self.assertIsNone(app.discover_backend(ports=[free]))
+
+    def test_discovery_defers_to_an_explicit_url(self):
+        """LOCAL_AGENT_SERVER_URL is an instruction, not a hint."""
+        with FakeBackend() as backend:
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            os.environ["LOCAL_AGENT_SERVER_URL"] = "http://127.0.0.1:1"
+            try:
+                self.assertIsNone(app.discover_backend(ports=[backend.port]))
+            finally:
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+                os.environ.pop("LOCAL_AGENT_SERVER_URL", None)
+
+    def test_discovery_does_not_rediscover_the_configured_url(self):
+        """The direct probe already covers it; discovery must not double-count."""
+        with FakeBackend() as backend:
+            original = app.BACKEND_URL
+            app.BACKEND_URL = backend.url
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            try:
+                self.assertIsNone(app.discover_backend(ports=[backend.port]))
+            finally:
+                app.BACKEND_URL = original
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+
+    def test_start_adopts_a_running_backend_instead_of_spawning(self):
+        """The reported failure: a second copy cannot start, so reuse the first."""
+        with FakeBackend() as backend:
+            original_url = app.BACKEND_URL
+            original_ports = app.BACKEND_CANDIDATE_PORTS
+            original_popen = app.subprocess.Popen
+            original_choice = app.load_backend_choice
+            spawned = []
+            app.BACKEND_URL = "http://127.0.0.1:1"  # our own port is dark
+            app.BACKEND_CANDIDATE_PORTS = (backend.port,)
+            app.load_backend_choice = lambda: {"mode": "auto", "url": ""}
+            app.subprocess.Popen = lambda *a, **k: spawned.append(a)
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            try:
+                result = app.start_backend()
+            finally:
+                app.BACKEND_URL = original_url
+                app.BACKEND_CANDIDATE_PORTS = original_ports
+                app.subprocess.Popen = original_popen
+                app.load_backend_choice = original_choice
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result.get("adopted_url"), backend.url)
+            self.assertEqual(spawned, [], "must adopt, not spawn a second copy")
+
+    def test_own_mode_does_not_adopt_a_running_backend(self):
+        """Choosing 'own' means this app's backend, even if another is up."""
+        with FakeBackend() as backend:
+            original_url = app.BACKEND_URL
+            original_ports = app.BACKEND_CANDIDATE_PORTS
+            original_choice = app.load_backend_choice
+            original_find = app.find_agent_canvas
+            original_inuse = app.port_in_use
+            original_popen = app.subprocess.Popen
+            original_timeout = app.BACKEND_START_TIMEOUT
+            spawned = []
+
+            class FakeProc:
+                pass
+
+            app.BACKEND_URL = "http://127.0.0.1:1"
+            app.BACKEND_CANDIDATE_PORTS = (backend.port,)
+            app.load_backend_choice = lambda: {"mode": "own", "url": ""}
+            app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+            app.port_in_use = lambda p: False
+            app.BACKEND_START_TIMEOUT = 0.1
+            app.subprocess.Popen = lambda *a, **k: (spawned.append(a), FakeProc())[1]
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            try:
+                app.start_backend()
+            finally:
+                app.BACKEND_URL = original_url
+                app.BACKEND_CANDIDATE_PORTS = original_ports
+                app.load_backend_choice = original_choice
+                app.find_agent_canvas = original_find
+                app.port_in_use = original_inuse
+                app.subprocess.Popen = original_popen
+                app.BACKEND_START_TIMEOUT = original_timeout
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+            self.assertEqual(len(spawned), 1, "own mode must spawn its own backend")
+
+    def test_choice_round_trips_and_validates(self):
+        ok, _ = app.save_backend_choice("custom", "http://127.0.0.1:3000")
+        self.assertTrue(ok)
+        self.assertEqual(app.load_backend_choice(),
+                         {"mode": "custom", "url": "http://127.0.0.1:3000"})
+
+        ok, detail = app.save_backend_choice("custom", "")
+        self.assertFalse(ok)
+        self.assertIn("URL", detail)
+
+        ok, detail = app.save_backend_choice("custom", "127.0.0.1:3000")
+        self.assertFalse(ok, "a scheme is required")
+
+        ok, detail = app.save_backend_choice("nonsense")
+        self.assertFalse(ok)
+        self.assertIn("mode", detail)
+
+    def test_missing_or_corrupt_choice_falls_back_to_auto(self):
+        self.assertEqual(app.load_backend_choice(), {"mode": "auto", "url": ""})
+        with open(app.backend_settings_path(), "w") as handle:
+            handle.write("{not json")
+        self.assertEqual(app.load_backend_choice(), {"mode": "auto", "url": ""})
+
+    def test_custom_mode_pins_the_url(self):
+        app.save_backend_choice("custom", "http://127.0.0.1:4321")
+        self.assertEqual(app.effective_backend_url(), "http://127.0.0.1:4321")
+
+    def test_env_override_beats_the_saved_choice(self):
+        app.save_backend_choice("custom", "http://127.0.0.1:4321")
+        os.environ["LOCAL_AGENT_SERVER_URL"] = "http://127.0.0.1:9999"
+        try:
+            self.assertEqual(app.effective_backend_url(), "http://127.0.0.1:9999")
+        finally:
+            os.environ.pop("LOCAL_AGENT_SERVER_URL", None)
+
+    def test_backend_use_endpoint_saves_the_choice(self):
+        with AppServer(self.tmp) as srv:
+            status, data = srv.post(
+                "/api/backend/use",
+                {"mode": "custom", "url": "http://127.0.0.1:3000"},
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(data["ok"])
+            self.assertEqual(app.load_backend_choice()["mode"], "custom")
+
+            status, data = srv.post("/api/backend/use", {"mode": "custom", "url": ""})
+            self.assertEqual(status, 400)
+            self.assertIn("error", data)
+
+    def test_status_reports_the_backend_mode(self):
+        app.save_backend_choice("custom", "http://127.0.0.1:1")
+        with AppServer(self.tmp) as srv:
+            _, body = srv.get("/api/status")
+        self.assertEqual(body["backend"]["mode"], "custom")
+        self.assertEqual(body["backend"]["url"], "http://127.0.0.1:1")
+
+
+    def test_start_uses_a_discovered_backend_end_to_end(self):
+        """The full reported scenario, over real sockets.
+
+        A backend is running (FakeBackend), the app's own URL is dark, and the
+        user sends a task. It must reach the running backend, not refuse.
+        """
+        with FakeUEFNServer() as editor, FakeBackend() as backend:
+            original_uefn = app.UEFN_MCP_URL
+            original_back = app.BACKEND_URL
+            original_ports = app.BACKEND_CANDIDATE_PORTS
+            original_settings = app.AGENT_SETTINGS_PATH
+            app.UEFN_MCP_URL = f"http://127.0.0.1:{editor.port}/mcp"
+            app.BACKEND_URL = "http://127.0.0.1:1"  # our own port is dark
+            app.BACKEND_CANDIDATE_PORTS = (backend.port,)
+            app.AGENT_SETTINGS_PATH = os.path.join(self.tmp, "missing.json")
+            os.environ["LOCAL_BACKEND_API_KEY"] = "test-key"
+            os.environ["LLM_API_KEY"] = "sk-test"
+            os.environ.pop("LLM_MODEL", None)
+            try:
+                with AppServer(self.tmp) as srv:
+                    status, data = srv.post("/api/start", {"task": "do a thing"})
+                    self.assertEqual(status, 200, data)
+                    self.assertTrue(data["ok"])
+                    self.assertIn("conv-abc123", data["url"])
+            finally:
+                app.UEFN_MCP_URL = original_uefn
+                app.BACKEND_URL = original_back
+                app.BACKEND_CANDIDATE_PORTS = original_ports
+                app.AGENT_SETTINGS_PATH = original_settings
+                os.environ.pop("LOCAL_BACKEND_API_KEY", None)
+                os.environ.pop("LLM_API_KEY", None)
 
 
 class StatusPayloadTests(unittest.TestCase):

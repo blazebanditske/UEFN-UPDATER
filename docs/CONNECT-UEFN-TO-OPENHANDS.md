@@ -207,10 +207,16 @@ uv tool install openhands --python 3.12
 Then start Agent Canvas, which runs the backend and the UI together:
 
 ```bash
-agent-canvas
+agent-canvas --port 3000
 ```
 
 That serves the UI on `http://localhost:3000` with a local backend attached.
+
+> **Always pass `--port`.** Bare `agent-canvas` defaults to `127.0.0.1:8000`,
+> which is UEFN's own MCP port, so a portless start collides with the editor and
+> neither side works. Use `3000` (or any other free port), and note that Agent
+> Canvas also pins two internal ports (`18000` and `18001`) that only one copy
+> can hold — see the note below.
 
 > **Running UEFN under Windows but preferring Linux tooling?** Everything the
 > agent touches is reached over HTTP on `127.0.0.1`, so Agent Canvas can run in
