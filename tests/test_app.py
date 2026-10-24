@@ -6,9 +6,11 @@ the status/start decisions are exercised end to end.
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1393,6 +1395,63 @@ class BackendChoiceTests(unittest.TestCase):
                 app.AGENT_SETTINGS_PATH = original_settings
                 os.environ.pop("LOCAL_BACKEND_API_KEY", None)
                 os.environ.pop("LLM_API_KEY", None)
+
+
+    def test_discovery_abandons_a_silent_port_within_its_budget(self):
+        """A port that accepts but never answers must not stall the page.
+
+        This is the CI regression: on a Windows runner, closed loopback ports
+        are filtered rather than refused, so a probe waited out its full
+        timeout on every candidate and /api/status blew past the client's 10s
+        budget. port_in_use now rules a closed port out first, and a silent
+        port is abandoned on a short budget.
+        """
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(1)
+        port = silent.getsockname()[1]
+        try:
+            started = time.monotonic()
+            found = app.discover_backend(ports=[port])
+            elapsed = time.monotonic() - started
+        finally:
+            silent.close()
+        self.assertIsNone(found)
+        self.assertLess(
+            elapsed, 4,
+            "a silent candidate must be abandoned quickly; the status page "
+            "polls every 10s and cannot afford a long wait",
+        )
+
+    def test_worst_case_discovery_fits_the_status_budget(self):
+        """The sum of every candidate budget must leave room to spare.
+
+        The page polls /api/status every 10s, and callers time out at 10s.
+        UEFN's own probe can take up to 8s, so discovery has to stay small.
+        """
+        worst_case = sum(app.BACKEND_PROBE_TIMEOUTS[p]
+                         for p in app.BACKEND_CANDIDATE_PORTS)
+        self.assertLess(
+            worst_case, 3,
+            "discovery must not dominate the status path",
+        )
+
+    def test_every_candidate_port_has_a_budget(self):
+        for port in app.BACKEND_CANDIDATE_PORTS:
+            self.assertIn(port, app.BACKEND_PROBE_TIMEOUTS,
+                          f"port {port} has no probe budget")
+
+    def test_closed_port_is_ruled_out_without_probing(self):
+        """port_in_use must short-circuit a closed port, so no probe is paid."""
+        free = app.free_port(0)
+        calls = []
+
+        def spy(url):
+            calls.append(url)
+            return True, "running"
+
+        app.discover_backend(ports=[free], probe=spy)
+        self.assertEqual(calls, [], "a closed port must not be probed")
 
 
 class StatusPayloadTests(unittest.TestCase):

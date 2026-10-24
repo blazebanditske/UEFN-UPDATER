@@ -56,12 +56,33 @@ AGENT_CANVAS_INTERNAL_PORTS = (18000, 18001)
 
 # Where a running backend might be listening. The app probes these to adopt one
 # instead of spawning a second agent-canvas that cannot start. 3010 is this
-# app's own default, 3000 is agent-canvas's documented local UI port, and 8000
-# is agent-canvas's bare default -- which UEFN's MCP server also uses, so a
-# match there is only trusted when /server_info identifies it as a backend.
-# 18000 is the agent-server's own port, reachable directly when a stack is up
-# but its ingress is not; it serves the same /server_info and /api routes.
+# app's own default; 3000 is agent-canvas's documented local UI port; 8000 is
+# agent-canvas's bare default -- which UEFN's MCP server also uses, so a match
+# there is only trusted when /server_info identifies it as a backend; 18000 is
+# the agent-server's own port, reachable when a stack is up but its ingress is
+# not.
 BACKEND_CANDIDATE_PORTS = (DEFAULT_BACKEND_PORT, 3000, 8000, 18000)
+
+# Probe budget per candidate, in seconds. This runs on the status path, which
+# the page polls every 10s, and AGENTS.md forbids a slow call there. A real
+# backend answers /server_info in tens of ms, so the ports that plausibly host
+# one get a little slack; 8000 and 18000 get less, because neither UEFN nor a
+# bare agent-server answers this route and waiting longer only slows the page.
+# A port that is closed is ruled out by port_in_use first and never waits.
+BACKEND_PROBE_TIMEOUTS = {
+    DEFAULT_BACKEND_PORT: 0.6,
+    3000: 0.6,
+    8000: 0.25,
+    18000: 0.25,
+}
+BACKEND_DEFAULT_PROBE_TIMEOUT = 1.0
+
+# Hard ceiling on the whole search, in seconds. The per-port budgets above are
+# only a guide; this is the guarantee. /api/status polls every 10s and callers
+# time out at 10s, while UEFN's own probe alone can take 8s, so discovery gets a
+# small fixed slice and stops when it is spent. A real backend answers in tens
+# of ms, so this never cuts a live candidate short in practice.
+BACKEND_DISCOVERY_BUDGET = 1.0
 
 HOME_DIR = os.path.expanduser("~")
 # Windows is the only platform UEFN ships on, so it is the platform that
@@ -174,9 +195,15 @@ def free_port(preferred: int) -> int:
     return preferred
 
 
-def port_in_use(port: int) -> bool:
+def port_in_use(port: int, timeout: float = 0.25) -> bool:
+    """True when something accepts a TCP connection on loopback `port`.
+
+    Kept short: this gates discovery on the status path, and a closed port is
+    answered (or refused) immediately. A filtered port costs the full timeout,
+    which is the price of not waiting on a probe that can never succeed.
+    """
     with socket.socket() as probe:
-        probe.settimeout(0.5)
+        probe.settimeout(timeout)
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
@@ -275,12 +302,22 @@ def discover_backend(ports=None, probe=None) -> dict | None:
     if os.environ.get("LOCAL_AGENT_SERVER_URL"):
         return None
 
-    candidate_ports = ports if ports is not None else BACKEND_CANDIDATE_PORTS
-    check = probe or (lambda url: probe_backend(url, timeout=1.5))
+    candidate_ports = BACKEND_CANDIDATE_PORTS if ports is None else ports
+    deadline = time.monotonic() + BACKEND_DISCOVERY_BUDGET
+
     for port in candidate_ports:
+        if time.monotonic() >= deadline:
+            break  # the budget is the guarantee; see BACKEND_DISCOVERY_BUDGET
+        if not port_in_use(port):
+            continue  # nothing there; cheaper and more certain than a probe
         url = f"http://127.0.0.1:{port}"
         if url.rstrip("/") == BACKEND_URL.rstrip("/"):
             continue  # already covered by the direct probe
+        budget = min(
+            BACKEND_PROBE_TIMEOUTS.get(port, BACKEND_DEFAULT_PROBE_TIMEOUT),
+            max(0.05, deadline - time.monotonic()),
+        )
+        check = probe or (lambda u, t=budget: probe_backend(u, timeout=t))
         try:
             ok, detail = check(url)
         except Exception:

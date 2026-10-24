@@ -138,10 +138,26 @@ These cost real debugging time to establish. Do not re-derive them.
   `agent_canvas_running_elsewhere()` is the test for the former, and it gates
   `backend_failure_code()` so the status row shows the right guide.
 - **Discovery is opt-in per call and defers to an explicit URL.** `discover_backend()`
-  probes `BACKEND_CANDIDATE_PORTS` (3010, 3000, 8000) but returns None when
-  `LOCAL_AGENT_SERVER_URL` is set: an explicit instruction is not a hint. It
+  probes `BACKEND_CANDIDATE_PORTS` (3010, 3000, 8000, 18000) but returns None
+  when `LOCAL_AGENT_SERVER_URL` is set: an explicit instruction is not a hint. It
   also skips the configured URL, which the direct probe already covers. A probe
   that raises is swallowed — a candidate we cannot reach is simply not one.
+- **Discovery has a hard wall-clock budget, and that is not optional.**
+  `BACKEND_DISCOVERY_BUDGET` (1s) caps the whole search; the per-port budgets in
+  `BACKEND_PROBE_TIMEOUTS` are only a guide, clamped to whatever is left of the
+  deadline. This exists because an earlier version summed 4s + 4×1.5s = 10s,
+  passed locally, then **failed CI on Windows**: that runner filters closed
+  loopback ports instead of refusing them, so every probe waited out its full
+  timeout, `/api/status` exceeded 10s, and two tests died with `TimeoutError`.
+  `port_in_use()` is checked first for exactly this reason — a closed port is
+  ruled out in microseconds and never reaches a probe. Measured worst case now:
+  8.1s, which is UEFN's own 8s probe plus ~0.1s, comfortably inside the 10s
+  poll. If you add a candidate, add its budget to `BACKEND_PROBE_TIMEOUTS`; one
+  test asserts every candidate has one, another asserts the total stays small.
+- **Never pipe `curl` into `grep -q` in the CI smoke test.** The runner uses
+  `set -o pipefail`, `grep -q` exits on its first match, curl then dies of
+  SIGPIPE with exit 23, and the step fails even though the check passed. Fetch
+  to a file and grep the file — see `check()` in build-app.yml.
 - **Backend choice is persisted in `backend.json`** under the workspace, via
   `load_backend_choice()`/`save_backend_choice()`. Modes are `auto` (adopt or
   start), `own` (always start on 3010), `custom` (pin a URL). The path is a

@@ -66,19 +66,34 @@ jobs:
           "./${{ matrix.path }}" --port 8799 --no-browser --workspace ./_smoke &
           APP_PID=$!
           sleep 8
-          curl -s --max-time 10 http://127.0.0.1:8799/ | grep -q "UEFN Link"
-          echo "UI served OK"
-          curl -s --max-time 10 http://127.0.0.1:8799/api/status | grep -q "workspace"
-          echo "API responded OK"
+
+          # Fetch to a file rather than piping into `grep -q`. Under the
+          # runner's `set -o pipefail`, `grep -q` exits on its first match and
+          # closes the pipe; curl then dies of SIGPIPE with exit 23 and the
+          # whole step fails even though the check passed. Reading a file
+          # sidesteps the pipe entirely.
+          check() {
+            local url="$1" pattern="$2" label="$3"
+            if ! curl -s --max-time 15 "$url" -o /tmp/smoke.out; then
+              echo "FAILED: could not fetch $url"
+              return 1
+            fi
+            if ! grep -q "$pattern" /tmp/smoke.out; then
+              echo "FAILED: $label (no match for '$pattern')"
+              return 1
+            fi
+            echo "$label OK"
+          }
+
+          check http://127.0.0.1:8799/ "UEFN Link" "UI served"
+          check http://127.0.0.1:8799/api/status "workspace" "API responded"
           # The reported Windows bug was a bare "npm" reaching subprocess; the
           # fix makes the app resolve the .cmd shim. Prove the shipped binary
           # ships the guide machinery too. fix-all itself is exercised by the
           # pytest suite above -- it is deliberately not called here, because on
           # Windows it would run a real `npm install -g`.
-          curl -s --max-time 10 http://127.0.0.1:8799/api/status | grep -q '"guide"'
-          echo "status guides present OK"
-          curl -s --max-time 10 http://127.0.0.1:8799/ | grep -q "renderGuide"
-          echo "UI ships the guide renderer OK"
+          check http://127.0.0.1:8799/api/status '"guide"' "status guides present"
+          check http://127.0.0.1:8799/ "renderGuide" "UI ships the guide renderer"
           kill $APP_PID 2>/dev/null || true
 
       - name: Upload artifact
