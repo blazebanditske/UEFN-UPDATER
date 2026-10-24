@@ -550,6 +550,14 @@ class GuideCoverageTests(unittest.TestCase):
         self.assertEqual(result["code"], "npm_missing")
         self.assertTrue(result["guide"]["steps"])
 
+    def test_port_busy_guide_names_the_port_and_how_to_find_the_owner(self):
+        """A user stuck on a busy port needs the number and a way to find it."""
+        guide = app.guide_for("backend_port_busy")
+        blob = " ".join(guide["steps"])
+        self.assertIn(str(app.DEFAULT_BACKEND_PORT), blob)
+        self.assertIn("netstat -ano", blob)
+        self.assertIn("LOCAL_AGENT_SERVER_URL", blob)
+
     def test_backend_code_distinguishes_missing_from_stopped(self):
         original = app.find_agent_canvas
         app.find_agent_canvas = lambda: None

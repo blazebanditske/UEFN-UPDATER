@@ -465,8 +465,14 @@ GUIDES = {
     ),
     "backend_port_busy": _guide(
         "Another program is using the backend port",
+        f"Something is holding port {DEFAULT_BACKEND_PORT} and it is not the "
+        "agent backend, so the app cannot start one.",
         "Close any other window of this app.",
         "Open Task Manager (Ctrl+Shift+Esc) and end any agent-canvas process.",
+        "To see what owns the port, open Command Prompt and run:  "
+        f"netstat -ano | findstr :{DEFAULT_BACKEND_PORT}",
+        "The last column is a PID. Find it on Task Manager's Details tab and "
+        "end that program, or set LOCAL_AGENT_SERVER_URL to a free port.",
         "Press Fix everything.",
         done="The Agent backend row turns green.",
     ),
