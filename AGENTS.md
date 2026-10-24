@@ -226,3 +226,11 @@ When you add a failure path, add its code to `GUIDES` and to the expected set in
   Keep it injectable: tests set it to 0.1s, otherwise the spawn test sleeps the
   full 90s and the suite triples in runtime. When you change the wait, change the
   constant, not a literal buried in the loop.
+- The status page is polled every 10s, so anything it touches must be cheap.
+  _status runs probe_uefn, probe_backend, and llm_status on threads: in sequence
+  their timeouts add up and a dead service stalls the whole page. For the same
+  reason npm_global_prefix() caches its answer -- spawning "npm prefix -g" costs
+  seconds on Windows, where npm is a shell script, and it used to run on every
+  poll. A failed lookup is deliberately NOT cached, so an install that happens
+  while the app is open is still picked up. Do not add a blocking call to the
+  status path without giving it a short timeout and a cache.
