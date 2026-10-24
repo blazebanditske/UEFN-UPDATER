@@ -550,6 +550,34 @@ class GuideCoverageTests(unittest.TestCase):
         self.assertEqual(result["code"], "npm_missing")
         self.assertTrue(result["guide"]["steps"])
 
+    def test_npm_global_prefix_is_cached_after_first_hit(self):
+        """The status page polls, so npm must not be spawned per request."""
+        calls = []
+
+        class Proc:
+            returncode = 0
+            stdout = "/usr/local\n"
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return Proc()
+
+        real_run = app.subprocess.run
+        real_cmd = app.npm_command
+        app.subprocess.run = fake_run
+        app.npm_command = lambda: "npm"
+        app._NPM_PREFIX_CACHE.clear()
+        try:
+            first = app.npm_global_prefix()
+            second = app.npm_global_prefix()
+        finally:
+            app.subprocess.run = real_run
+            app.npm_command = real_cmd
+            app._NPM_PREFIX_CACHE.clear()
+        self.assertEqual(first, "/usr/local")
+        self.assertEqual(second, "/usr/local")
+        self.assertEqual(len(calls), 1, "npm should be spawned only once")
+
     def test_port_busy_guide_names_the_port_and_how_to_find_the_owner(self):
         """A user stuck on a busy port needs the number and a way to find it."""
         guide = app.guide_for("backend_port_busy")

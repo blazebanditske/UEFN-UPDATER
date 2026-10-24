@@ -295,22 +295,38 @@ def npm_failure_code(output: str) -> str:
     return "npm_failed"
 
 
+# npm prefix -g answers with the same path for the life of the process, but
+# launching npm costs seconds on Windows (it is a shell script there). The
+# status page polls, so resolving it on every request made the page crawl and
+# could blow a caller's timeout. Resolve once and remember it.
+_NPM_PREFIX_CACHE = {}
+
+
 def npm_global_prefix() -> str | None:
     """Where npm puts global binaries, so the app can find agent-canvas even
-    when the shell PATH has not been reloaded since the install."""
+    when the shell PATH has not been reloaded since the install.
+
+    Cached after the first successful answer. A miss is not cached, so the app
+    still notices an install that happens while it is running.
+    """
+    if "value" in _NPM_PREFIX_CACHE:
+        return _NPM_PREFIX_CACHE["value"]
     npm = npm_command()
     if not npm:
         return None
     try:
         proc = subprocess.run(
-            [npm, "prefix", "-g"], capture_output=True, text=True, timeout=20
+            [npm, "prefix", "-g"], capture_output=True, text=True, timeout=10
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
         return None
     prefix = proc.stdout.strip()
-    return prefix or None
+    if not prefix:
+        return None
+    _NPM_PREFIX_CACHE["value"] = prefix
+    return prefix
 
 
 def find_agent_canvas() -> str | None:
@@ -1135,9 +1151,32 @@ class AppHandler(BaseHTTPRequestHandler):
 
     # -- handlers
     def _status(self):
-        uefn_ok, uefn_msg = probe_uefn(UEFN_MCP_URL)
-        back_ok, back_msg = probe_backend()
-        llm_ok, llm_msg = llm_status()
+        # Probe the three services at once. Run in sequence, their timeouts add
+        # up (UEFN 8s + backend 4s) and a slow or absent service can push the
+        # whole response past a caller's patience. Concurrently the reply costs
+        # about the slowest single probe.
+        results = {}
+
+        def run(name, fn):
+            try:
+                results[name] = fn()
+            except Exception as exc:  # a probe must never take down the page
+                results[name] = (False, f"probe failed: {exc}")
+
+        probes = [
+            ("uefn", lambda: probe_uefn(UEFN_MCP_URL)),
+            ("backend", probe_backend),
+            ("llm", llm_status),
+        ]
+        workers = [threading.Thread(target=run, args=(n, f)) for n, f in probes]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        uefn_ok, uefn_msg = results["uefn"]
+        back_ok, back_msg = results["backend"]
+        llm_ok, llm_msg = results["llm"]
         self._json(200, {
             "uefn": {
                 "ok": uefn_ok, "detail": uefn_msg, "url": UEFN_MCP_URL,
