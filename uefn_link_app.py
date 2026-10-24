@@ -32,7 +32,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "UEFN Link"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DEFAULT_APP_PORT = 8765
 UEFN_MCP_URL = os.environ.get("UEFN_MCP_URL", "http://127.0.0.1:8000/mcp")
 # UEFN's embedded MCP server owns 8000 by default. The agent backend must not
@@ -45,6 +45,9 @@ BACKEND_URL = os.environ.get(
 CLOUD_CANVAS_URL = "https://app.all-hands.dev/canvas/conversations"
 
 HOME_DIR = os.path.expanduser("~")
+# Windows is the only platform UEFN ships on, so it is the platform that
+# matters. Kept as a constant so tests can exercise both branches anywhere.
+IS_WINDOWS = os.name == "nt"
 WORKSPACE_DIR = os.environ.get("UEFN_AGENT_WORKSPACE", os.path.join(HOME_DIR, "UEFN-Agent"))
 UPLOAD_DIR = os.path.join(WORKSPACE_DIR, "uploads")
 
@@ -240,12 +243,35 @@ def which_any(*names) -> str | None:
     return None
 
 
+def resolve_command(name: str) -> str:
+    """Return a path subprocess can actually launch for `name`.
+
+    On Windows, npm/node/uvx are `.cmd`/`.bat` shims. shutil.which finds them,
+    but handing the bare string to subprocess raises `[WinError 2] The system
+    cannot find the file specified`, because CreateProcess only appends `.exe`
+    and will not execute a batch file by bare name. Resolve to the real path
+    (which keeps the extension CreateProcess needs) before spawning.
+    """
+    suffixes = [""]
+    if IS_WINDOWS:
+        suffixes += [".cmd", ".exe", ".bat"]
+    return which_any(*(name + suffix for suffix in suffixes)) or name
+
+
+def npm_command() -> str:
+    """Resolved npm. Empty string means npm is genuinely not installed."""
+    return which_any("npm", "npm.cmd", "npm.exe") or ""
+
+
 def npm_global_prefix() -> str | None:
     """Where npm puts global binaries, so the app can find agent-canvas even
     when the shell PATH has not been reloaded since the install."""
+    npm = npm_command()
+    if not npm:
+        return None
     try:
         proc = subprocess.run(
-            ["npm", "prefix", "-g"], capture_output=True, text=True, timeout=20
+            [npm, "prefix", "-g"], capture_output=True, text=True, timeout=20
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -257,7 +283,7 @@ def npm_global_prefix() -> str | None:
 
 def find_agent_canvas() -> str | None:
     """Locate agent-canvas on PATH, or in the usual global install locations."""
-    found = which_any("agent-canvas", "agent-canvas.cmd")
+    found = which_any("agent-canvas", "agent-canvas.cmd", "agent-canvas.exe")
     if found:
         return found
     prefix = npm_global_prefix()
@@ -265,6 +291,7 @@ def find_agent_canvas() -> str | None:
         for candidate in (
             os.path.join(prefix, "bin", "agent-canvas"),
             os.path.join(prefix, "agent-canvas.cmd"),
+            os.path.join(prefix, "agent-canvas.exe"),
             os.path.join(prefix, "agent-canvas"),
         ):
             if os.path.isfile(candidate):
@@ -275,12 +302,13 @@ def find_agent_canvas() -> str | None:
 def environment_report() -> dict:
     """Everything the app can learn about this machine without changing it."""
     node = which_any("node", "node.exe")
-    npm = which_any("npm", "npm.cmd")
+    npm = npm_command()
     canvas = find_agent_canvas()
     return {
         "node": bool(node),
         "node_path": node,
         "npm": bool(npm),
+        "npm_path": npm or None,
         "uv": bool(which_any("uv", "uv.exe", "uvx", "uvx.exe")),
         "agent_canvas": bool(canvas),
         "agent_canvas_path": canvas,
@@ -291,7 +319,188 @@ def environment_report() -> dict:
     }
 
 
-def install_backend_dependencies(progress=None) -> tuple[bool, str]:
+# --- failure guides --------------------------------------------------------
+# Every failure the app can produce carries a step-by-step repair. These are
+# written for someone who does not want to read a stack trace: numbered steps,
+# the exact command to paste, and what "done" looks like. The UI renders these
+# on the failed row, so a red dot always explains itself.
+def _guide(title: str, *steps: str, done: str = "") -> dict:
+    return {"title": title, "steps": [s for s in steps if s], "done": done}
+
+
+GUIDES = {
+    "npm_missing": _guide(
+        "Node.js and npm are not installed",
+        "Open https://nodejs.org in your browser.",
+        "Download the LTS installer for Windows (.msi).",
+        "Run the installer and accept the defaults. Keep the checkbox that "
+        "adds Node to PATH.",
+        "Close this app completely, then start it again.",
+        "Press Fix everything.",
+        done="Node.js and npm are on PATH — the app will detect them on restart.",
+    ),
+    "npm_unwritable": _guide(
+        "npm's global folder is not writable",
+        "Close this app.",
+        "Right-click your terminal (Command Prompt or PowerShell) and choose "
+        "Run as administrator.",
+        "Run:  npm config set prefix \"%APPDATA%\\npm\"",
+        "Close the terminal, then start this app normally.",
+        "Press Fix everything.",
+        done="agent-canvas installs into your own AppData folder, so no admin "
+             "rights are needed after this.",
+    ),
+    "npm_failed": _guide(
+        "The agent-canvas install did not finish",
+        "Check your internet connection.",
+        "Open a terminal and run:  npm install -g @openhands/agent-canvas",
+        "If it prints a permission error, follow the 'not writable' steps.",
+        "If it prints a network error, retry — npm downloads a few MB.",
+        "When it succeeds, press Fix everything again.",
+        done="A global agent-canvas binary exists and `agent-canvas --version` runs.",
+    ),
+    "npm_error": _guide(
+        "npm could not be started",
+        "Close this app completely.",
+        "Start it again. The app re-resolves npm on every launch.",
+        "Press Fix everything.",
+        "If it still fails, open a terminal and run:  npm --version",
+        "If that also fails, reinstall Node.js from https://nodejs.org.",
+        done="`npm --version` prints a version number.",
+    ),
+    "backend_missing": _guide(
+        "The agent backend is not installed",
+        "Press the Fix button on the Agent backend row.",
+        "If that fails, open a terminal and run:  "
+        "npm install -g @openhands/agent-canvas",
+        "Wait for it to finish — it downloads a few MB.",
+        "Press Fix everything.",
+        done="The Agent backend row turns green.",
+    ),
+    "backend_stopped": _guide(
+        "The agent backend is installed but not running",
+        "Press Fix everything. The app starts it for you.",
+        "If it stays red, open Task Manager (Ctrl+Shift+Esc) and end any "
+        "agent-canvas process, then press Fix everything again.",
+        "If it still stays red, open a terminal and run:  "
+        "agent-canvas --backend-only",
+        "Leave that terminal open while you use this app.",
+        done="The Agent backend row turns green.",
+    ),
+    "backend_port_busy": _guide(
+        "Another program is using the backend port",
+        "Close any other window of this app.",
+        "Open Task Manager (Ctrl+Shift+Esc) and end any agent-canvas process.",
+        "Press Fix everything.",
+        done="The Agent backend row turns green.",
+    ),
+    "backend_timeout": _guide(
+        "The backend started but did not answer in time",
+        "Wait about a minute — the first start is the slowest.",
+        "Press Re-check.",
+        "If it is still red, open the log the app names in the message.",
+        "Close any other window of this app, then press Fix everything.",
+        done="The Agent backend row turns green.",
+    ),
+    "backend_error": _guide(
+        "The backend could not be started",
+        "Close any other window of this app.",
+        "Press Fix everything.",
+        "If it still fails, open a terminal and run:  agent-canvas --backend-only",
+        "Read the last few lines it prints — they name the cause.",
+        done="The Agent backend row turns green.",
+    ),
+    "uefn_ini_missing": _guide(
+        "UEFN's settings file was not found",
+        "Open UEFN once and let it finish loading a project.",
+        "Close UEFN.",
+        "Press Fix everything.",
+        "Reopen UEFN with your project.",
+        done="The app writes Auto Start Server into UEFN's preferences.",
+    ),
+    "uefn_ini_unwritable": _guide(
+        "UEFN's settings file could not be written",
+        "Close UEFN — it locks its preferences file while running.",
+        "Press Fix everything.",
+        "If it still fails, close this app and start it as Administrator.",
+        "Reopen UEFN with your project.",
+        done="Auto Start Server is on in UEFN's preferences.",
+    ),
+    "uefn_project_missing": _guide(
+        "No UEFN project folder was found",
+        "Find your project: in UEFN it is the folder holding your .uefnproject "
+        "file, usually under Documents\\Fortnite Projects.",
+        "Close this app.",
+        "Open a terminal and point the app at that folder, then start it again:"
+        "  set UEFN_PROJECT_PATH=C:\\Users\\you\\Documents\\Fortnite Projects\\YourIsland",
+        "Press Fix everything.",
+        done="The UEFN project flags step reports success.",
+    ),
+    "uefn_project_unreadable": _guide(
+        "The project file could not be read",
+        "Close UEFN — it may be writing the file right now.",
+        "Press Fix everything.",
+        "If it still fails, check the .uefnproject file is valid JSON:  "
+        "open it in Notepad and look for obvious damage.",
+        "Restore from the .uefn-link.bak copy the app made, if one exists.",
+        done="The UEFN project flags step reports success.",
+    ),
+    "uefn_project_unwritable": _guide(
+        "The project file could not be written",
+        "Close UEFN.",
+        "Check the project folder is not read-only.",
+        "Press Fix everything.",
+        "If it still fails, copy the project to a folder you own and set "
+        "UEFN_PROJECT_PATH to the copy.",
+        done="The UEFN project flags step reports success.",
+    ),
+    "uefn_not_connected": _guide(
+        "UEFN is not answering",
+        "In UEFN open Project Settings and turn on Python Editor Scripting "
+        "AND UEFN MCP Toolsets (under Beta Access).",
+        "Restart UEFN with your project open. Toolsets publish at startup only.",
+        "Press Re-check.",
+        "If the app wrote the settings for you, a restart is still required.",
+        done="The Unreal Editor for Fortnite row turns green.",
+    ),
+    "model_missing": _guide(
+        "No model key is set",
+        "Press the Set key button on the Model row.",
+        "Pick your provider from the dropdown.",
+        "Paste your API key and press Save key.",
+        "Or, to use OpenHands Cloud, run in a terminal:  openhands login",
+        done="The Model row shows your model name and turns green.",
+    ),
+}
+
+
+def guide_for(code: str) -> dict:
+    return GUIDES.get(code, _guide("Something went wrong", "Press Fix everything to retry."))
+
+
+def backend_failure_code() -> str:
+    """Why is the backend row red? Pick the guide that matches the machine.
+
+    Distinguishes "not installed" from "installed but stopped", because the
+    repair is different and the app can tell them apart for free.
+    """
+    if not find_agent_canvas():
+        return "backend_missing"
+    return "backend_stopped"
+
+
+def ok_result(detail: str, **extra) -> dict:
+    """A step that worked. Shaped like fail_result so the UI has one code path."""
+    return {"ok": True, "detail": detail, "guide": None, **extra}
+
+
+def fail_result(code: str, detail: str, **extra) -> dict:
+    """A step that failed, always carrying a step-by-step repair."""
+    return {"ok": False, "detail": detail, "guide": guide_for(code),
+            "code": code, **extra}
+
+
+def install_backend_dependencies(progress=None) -> dict:
     """Install agent-canvas globally with npm. This is the one download the app
     performs, and only when the user asks for it.
 
@@ -303,45 +512,46 @@ def install_backend_dependencies(progress=None) -> tuple[bool, str]:
             progress(message)
 
     if find_agent_canvas():
-        return True, "agent-canvas is already installed"
+        return ok_result("agent-canvas is already installed")
 
-    if not which_any("npm", "npm.cmd"):
-        return False, (
-            "npm was not found. Install Node.js 24 or later from "
-            "https://nodejs.org, reopen this app, then try again."
+    npm = npm_command()
+    if not npm:
+        return fail_result(
+            "npm_missing",
+            "npm was not found on this machine.",
         )
 
     prefix = npm_global_prefix()
     if prefix and not os.access(prefix, os.W_OK):
-        return False, (
-            f"npm's global folder ({prefix}) is not writable by this user, so "
-            "a global install cannot succeed. Either run this app as "
-            "Administrator, or point npm at a folder you own:\n"
-            f"    npm config set prefix \"{os.path.join(HOME_DIR, 'npm-global')}\"\n"
-            "then reopen this app and press Fix again."
+        return fail_result(
+            "npm_unwritable",
+            f"npm's global folder ({prefix}) is not writable by this user.",
         )
 
     say("Installing agent-canvas (this downloads a few MB)…")
     try:
         proc = subprocess.run(
-            ["npm", "install", "-g", "@openhands/agent-canvas"],
+            [npm, "install", "-g", "@openhands/agent-canvas"],
             capture_output=True, text=True, timeout=900,
         )
     except subprocess.TimeoutExpired:
-        return False, "npm install timed out after 15 minutes"
+        return fail_result(
+            "npm_failed", "npm install timed out after 15 minutes.")
     except OSError as exc:
-        return False, f"could not run npm: {exc}"
+        # This is the WinError 2 path: npm resolved, but could not be executed.
+        return fail_result("npm_error", f"could not run npm: {exc}")
 
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip()[-400:]
-        return False, f"npm install failed: {tail}"
+        return fail_result("npm_failed", f"npm install failed: {tail}")
 
     if not find_agent_canvas():
-        return False, (
+        return fail_result(
+            "npm_failed",
             "Installed, but agent-canvas is not on PATH yet. Restart this app "
-            "so it picks up the new PATH entry."
+            "so it picks up the new PATH entry.",
         )
-    return True, "agent-canvas installed"
+    return ok_result("agent-canvas installed")
 
 
 def uefn_ini_path() -> str | None:
@@ -414,7 +624,7 @@ def read_ini_keys(path: str, section: str, keys) -> dict:
     return found
 
 
-def configure_uefn_autostart() -> tuple[bool, str]:
+def configure_uefn_autostart() -> dict:
     """Enable Auto Start Server so the editor serves MCP on every launch.
 
     Without this the server only runs if the user starts it by hand each
@@ -422,19 +632,20 @@ def configure_uefn_autostart() -> tuple[bool, str]:
     """
     path = uefn_ini_path()
     if not path or not os.path.exists(path):
-        return False, (
-            "UEFN's preferences file was not found. Open UEFN once so it "
-            "writes its settings, then try again."
+        return fail_result(
+            "uefn_ini_missing",
+            "UEFN's preferences file was not found.",
         )
     try:
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             text = handle.read()
     except OSError as exc:
-        return False, f"could not read UEFN preferences: {exc}"
+        return fail_result(
+            "uefn_ini_unwritable", f"could not read UEFN preferences: {exc}")
 
     updated, changed = set_ini_keys(text, MCP_INI_SECTION, MCP_INI_KEYS)
     if not changed:
-        return True, "Auto Start Server was already on"
+        return ok_result("Auto Start Server was already on")
 
     backup = path + ".uefn-link.bak"
     try:
@@ -443,8 +654,9 @@ def configure_uefn_autostart() -> tuple[bool, str]:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(updated)
     except OSError as exc:
-        return False, f"could not write UEFN preferences: {exc}"
-    return True, "Auto Start Server enabled (takes effect next UEFN start)"
+        return fail_result(
+            "uefn_ini_unwritable", f"could not write UEFN preferences: {exc}")
+    return ok_result("Auto Start Server enabled (takes effect next UEFN start)")
 
 
 def find_uefn_project() -> str | None:
@@ -467,7 +679,7 @@ def find_uefn_project() -> str | None:
     return None
 
 
-def enable_project_beta_flags(project: str | None = None) -> tuple[bool, str]:
+def enable_project_beta_flags(project: str | None = None) -> dict:
     """Set the Python and MCP Toolset beta flags in the project's .uefnproject.
 
     This mirrors the two checkboxes the manual setup asks for. It is additive:
@@ -475,19 +687,21 @@ def enable_project_beta_flags(project: str | None = None) -> tuple[bool, str]:
     """
     project = project or find_uefn_project()
     if not project:
-        return False, (
-            "No UEFN project folder found. Set UEFN_PROJECT_PATH to the folder "
-            "that contains your .uefnproject file."
+        return fail_result(
+            "uefn_project_missing",
+            "No UEFN project folder found.",
         )
     marker = os.path.join(project, ".uefnproject")
     if not os.path.isfile(marker):
-        return False, f"no .uefnproject in {project}"
+        return fail_result(
+            "uefn_project_missing", f"no .uefnproject in {project}")
 
     try:
         with open(marker, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
-        return False, f"could not read .uefnproject: {exc}"
+        return fail_result(
+            "uefn_project_unreadable", f"could not read .uefnproject: {exc}")
 
     experimental = data.setdefault("dataSets", {}).setdefault("experimental", {})
     changed = False
@@ -498,7 +712,7 @@ def enable_project_beta_flags(project: str | None = None) -> tuple[bool, str]:
             changed = True
 
     if not changed:
-        return True, "Project flags were already on"
+        return ok_result("Project flags were already on")
 
     backup = marker + ".uefn-link.bak"
     try:
@@ -507,8 +721,9 @@ def enable_project_beta_flags(project: str | None = None) -> tuple[bool, str]:
         with open(marker, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent="\t", ensure_ascii=False)
     except OSError as exc:
-        return False, f"could not write .uefnproject: {exc}"
-    return True, (
+        return fail_result(
+            "uefn_project_unwritable", f"could not write .uefnproject: {exc}")
+    return ok_result(
         "Enabled Python Editor Scripting and UEFN MCP Toolsets in the project. "
         "Restart UEFN for them to apply."
     )
@@ -646,7 +861,7 @@ def llm_status() -> tuple[bool, str]:
     return True, llm["model"]
 
 
-def start_backend(port: int = DEFAULT_BACKEND_PORT) -> tuple[bool, str]:
+def start_backend(port: int = DEFAULT_BACKEND_PORT) -> dict:
     """Start `agent-canvas --backend-only` and wait for it to answer.
 
     The editor's MCP server is loopback-only, so the agent has to run on this
@@ -661,22 +876,22 @@ def start_backend(port: int = DEFAULT_BACKEND_PORT) -> tuple[bool, str]:
     # port it is given.
     ok, _ = probe_backend()
     if ok:
-        return True, "already running"
+        return ok_result("already running")
 
     canvas = find_agent_canvas()
     if not canvas:
-        return False, (
-            "agent-canvas is not installed. Press 'Fix' on the backend row, or "
-            "run:  npm install -g @openhands/agent-canvas"
+        return fail_result(
+            "backend_missing",
+            "agent-canvas is not installed.",
         )
 
     if port_in_use(port):
         # Something else owns the port and it is not a healthy backend we can
         # use. Starting anyway would collide on the internal ports too.
-        return False, (
+        return fail_result(
+            "backend_port_busy",
             f"port {port} is in use by another process, and the agent backend "
-            "is not answering on it. Stop whatever is using it (often a second "
-            "agent-canvas), then try again."
+            "is not answering on it.",
         )
 
     log_path = os.path.join(WORKSPACE_DIR, "backend.log")
@@ -684,22 +899,26 @@ def start_backend(port: int = DEFAULT_BACKEND_PORT) -> tuple[bool, str]:
     try:
         with open(log_path, "ab") as log:
             subprocess.Popen(
-                [canvas, "--backend-only", "--port", str(port)],
+                [resolve_command(canvas), "--backend-only", "--port", str(port)],
                 stdout=log,
                 stderr=log,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
     except OSError as exc:
-        return False, f"could not launch agent-canvas: {exc}"
+        return fail_result(
+            "backend_error", f"could not launch agent-canvas: {exc}")
 
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         ok, detail = probe_backend()
         if ok:
-            return True, "started"
+            return ok_result("started")
         time.sleep(2)
-    return False, f"started but not answering after 90s (see {log_path})"
+    return fail_result(
+        "backend_timeout",
+        f"started but not answering after 90s (see {log_path})",
+    )
 
 
 # --- server ----------------------------------------------------------------
@@ -777,9 +996,18 @@ class AppHandler(BaseHTTPRequestHandler):
         back_ok, back_msg = probe_backend()
         llm_ok, llm_msg = llm_status()
         self._json(200, {
-            "uefn": {"ok": uefn_ok, "detail": uefn_msg, "url": UEFN_MCP_URL},
-            "backend": {"ok": back_ok, "detail": back_msg, "url": BACKEND_URL},
-            "llm": {"ok": llm_ok, "detail": llm_msg},
+            "uefn": {
+                "ok": uefn_ok, "detail": uefn_msg, "url": UEFN_MCP_URL,
+                "guide": None if uefn_ok else guide_for("uefn_not_connected"),
+            },
+            "backend": {
+                "ok": back_ok, "detail": back_msg, "url": BACKEND_URL,
+                "guide": None if back_ok else guide_for(backend_failure_code()),
+            },
+            "llm": {
+                "ok": llm_ok, "detail": llm_msg,
+                "guide": None if llm_ok else guide_for("model_missing"),
+            },
             "cli": has_openhands_cli(),
             "canvas": has_agent_canvas(),
             "workspace": WORKSPACE_DIR,
@@ -792,19 +1020,17 @@ class AppHandler(BaseHTTPRequestHandler):
         })
 
     def _backend_start(self):
-        ok, detail = start_backend()
-        self._json(200 if ok else 500, {"ok": ok, "detail": detail})
+        self._json(200, start_backend())
 
     def _backend_install(self):
-        ok, detail = install_backend_dependencies()
-        self._json(200 if ok else 500, {"ok": ok, "detail": detail})
+        self._json(200, install_backend_dependencies())
 
     def _uefn_fix(self):
         results = []
-        ok_ini, ini_detail = configure_uefn_autostart()
-        results.append({"step": "autostart", "ok": ok_ini, "detail": ini_detail})
-        ok_flags, flags_detail = enable_project_beta_flags()
-        results.append({"step": "project flags", "ok": ok_flags, "detail": flags_detail})
+        ini = configure_uefn_autostart()
+        results.append({"step": "autostart", **ini})
+        flags = enable_project_beta_flags()
+        results.append({"step": "project flags", **flags})
         self._json(200, {"ok": all(r["ok"] for r in results), "results": results})
 
     def _llm_save(self):
@@ -822,37 +1048,50 @@ class AppHandler(BaseHTTPRequestHandler):
         self._json(200 if ok else 400, {"ok": ok, "detail": detail})
 
     def _fix_all(self):
-        """One call that does everything this machine can do by itself."""
+        """One call that does everything this machine can do by itself.
+
+        Each step carries its own guide on failure, so a red dot always
+        explains how to clear it.
+        """
         steps = []
 
-        ok, detail = install_backend_dependencies()
-        steps.append({"step": "install backend", "ok": ok, "detail": detail})
+        install = install_backend_dependencies()
+        steps.append({"step": "install backend", **install})
 
-        ok, detail = start_backend()
-        steps.append({"step": "start backend", "ok": ok, "detail": detail})
+        backend = start_backend()
+        steps.append({"step": "start backend", **backend})
 
-        ok_ini, ini_detail = configure_uefn_autostart()
-        steps.append({"step": "UEFN auto-start", "ok": ok_ini, "detail": ini_detail})
+        ini = configure_uefn_autostart()
+        steps.append({"step": "UEFN auto-start", **ini})
 
-        ok_flags, flags_detail = enable_project_beta_flags()
-        steps.append({"step": "UEFN project flags", "ok": ok_flags, "detail": flags_detail})
+        flags = enable_project_beta_flags()
+        steps.append({"step": "UEFN project flags", **flags})
 
         uefn_ok, uefn_detail = probe_uefn(UEFN_MCP_URL)
-        steps.append({
-            "step": "UEFN connection",
-            "ok": uefn_ok,
-            "detail": uefn_detail if uefn_ok else
-                      f"{uefn_detail} — restart UEFN with the project open",
-        })
+        if uefn_ok:
+            steps.append({"step": "UEFN connection", **ok_result(uefn_detail)})
+        else:
+            steps.append({
+                "step": "UEFN connection",
+                **fail_result(
+                    "uefn_not_connected",
+                    f"{uefn_detail} — restart UEFN with the project open",
+                ),
+            })
 
         llm_ok, llm_detail = llm_status()
-        steps.append({
-            "step": "model credential",
-            "ok": llm_ok,
-            "detail": llm_detail if llm_ok else
-                      "needs your key — enter it below (the one step that is not automatable)",
-            "manual": not llm_ok,
-        })
+        if llm_ok:
+            steps.append({"step": "model credential", **ok_result(llm_detail)})
+        else:
+            steps.append({
+                "step": "model credential",
+                **fail_result(
+                    "model_missing",
+                    "needs your key — enter it below (the one step that is not "
+                    "automatable)",
+                    manual=True,
+                ),
+            })
 
         self._json(200, {
             "ok": all(s["ok"] for s in steps),
@@ -894,7 +1133,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 "fix": "Install it with:  uv tool install openhands --python 3.12",
             })
         proc = subprocess.run(
-            ["openhands", "mcp", "add", "uefn", "--transport", "http", UEFN_MCP_URL],
+            [resolve_command("openhands"), "mcp", "add", "uefn",
+             "--transport", "http", UEFN_MCP_URL],
             capture_output=True, text=True,
         )
         if proc.returncode != 0:
@@ -1046,6 +1286,17 @@ a{color:var(--accent)}
 .note{color:var(--dim);font-size:12.5px;margin-top:12px}
 button.sm{padding:4px 10px;font-size:12px;margin-left:10px}
 .row{align-items:center}
+/* Failure guides: a red dot always explains how to clear it. */
+.step{padding:5px 0;font-size:13.5px}
+.step .sh{font-weight:500;word-break:break-word}
+.step.good .sh{color:var(--ok)}
+.step.bad .sh{color:var(--bad)}
+.guide{margin:8px 0 6px;padding:11px 13px;background:#0d1117;
+border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:8px}
+.guide .gt{font-weight:600;margin-bottom:7px;font-size:13px}
+.guide ol{margin:0;padding-left:20px;font-size:13px;color:var(--fg)}
+.guide li{margin:3px 0}
+.guide .gd{margin-top:8px;font-size:12.5px;color:var(--ok)}
 select{background:#0f1216;color:var(--fg);border:1px solid var(--line);
 border-radius:8px;padding:8px;font:inherit;width:100%}
 </style></head><body><div class="wrap">
@@ -1060,6 +1311,7 @@ border-radius:8px;padding:8px;font:inherit;width:100%}
 <button class="ghost" onclick="refresh()">Re-check</button>
 <button class="ghost" id="btn-reg" onclick="register()">Register UEFN with OpenHands</button></div>
 <div class="note" id="workspace"></div>
+<div id="statusguides"></div>
 <div class="note" id="fixlog"></div>
 </div>
 
@@ -1115,9 +1367,24 @@ async function refresh(){
     $('f-llm').style.display=s.llm.ok?'none':'';
     $('btn-reg').style.display=s.cli?'':'none';
     $('workspace').textContent='Workspace: '+s.workspace+'  ·  v'+s.version;
+    renderStatusGuides(s);
     if(!presets.length&&s.presets){presets=s.presets;fillPresets()}
     renderFiles(s.uploads);
   }catch(e){show('err','Cannot reach the app server. Is it still running?')}
+}
+// Show the repair steps for whatever is red, so a bad row explains itself
+// without the user having to press Fix first.
+function renderStatusGuides(s){
+  const box=$('statusguides');box.innerHTML='';
+  [['Unreal Editor for Fortnite',s.uefn],['Agent backend',s.backend],['Model',s.llm]]
+    .forEach(([name,row])=>{
+      if(row&&!row.ok&&row.guide){
+        const head=document.createElement('div');
+        head.className='note';head.style.marginTop='10px';
+        head.textContent=name+' needs attention:';
+        box.appendChild(head);box.appendChild(renderGuide(row.guide));
+      }
+    });
 }
 let presets=[];
 function fillPresets(){
@@ -1136,12 +1403,36 @@ function toggleKeyForm(){
   const c=$('keycard');
   c.style.display=c.style.display==='none'?'':'none';
 }
-function logStep(name,ok,detail){
+function logStep(name,ok,detail,guide){
   const el=$('fixlog');
-  const line=document.createElement('div');
-  line.textContent=(ok?'✓ ':'• ')+name+(detail?' — '+detail:'');
-  line.style.color=ok?'var(--ok,#5bd66f)':'var(--warn,#e8b84b)';
-  el.appendChild(line);
+  const row=document.createElement('div');
+  row.className='step '+(ok?'good':'bad');
+  const head=document.createElement('div');
+  head.className='sh';
+  head.textContent=(ok?'✓ ':'• ')+name+(detail?' — '+detail:'');
+  row.appendChild(head);
+  if(!ok&&guide)row.appendChild(renderGuide(guide));
+  el.appendChild(row);
+}
+function renderGuide(guide){
+  const box=document.createElement('div');
+  box.className='guide';
+  if(guide.title){
+    const t=document.createElement('div');
+    t.className='gt';t.textContent=guide.title;box.appendChild(t);
+  }
+  if(guide.steps&&guide.steps.length){
+    const ol=document.createElement('ol');
+    guide.steps.forEach(s=>{
+      const li=document.createElement('li');li.textContent=s;ol.appendChild(li);
+    });
+    box.appendChild(ol);
+  }
+  if(guide.done){
+    const d=document.createElement('div');
+    d.className='gd';d.textContent='Done when: '+guide.done;box.appendChild(d);
+  }
+  return box;
 }
 function clearLog(){$('fixlog').innerHTML=''}
 async function fixAll(){
@@ -1149,9 +1440,9 @@ async function fixAll(){
   show('ok','Working through every step this machine can do on its own…');
   try{
     const r=await (await fetch('/api/fix-all',{method:'POST'})).json();
-    r.steps.forEach(s=>logStep(s.step,s.ok,s.detail));
+    r.steps.forEach(s=>logStep(s.step,s.ok,s.detail,s.guide));
     if(r.ok){show('ok','Everything is green. You can send work to UEFN.')}
-    else{show('ok','Done what I can. Still needed: '+r.needs.join(', '))}
+    else{show('ok','Done what I can. Still needed: '+r.needs.join(', ')+' — see the steps below.')}
   }catch(e){show('err','Fix-all failed: '+e)}
   b.disabled=false;b.textContent='Fix everything';
   refresh();
@@ -1160,11 +1451,11 @@ async function fixBackend(){
   clearLog();show('ok','Installing and starting the agent backend…');
   try{
     const i=await (await fetch('/api/backend/install',{method:'POST'})).json();
-    logStep('install backend',i.ok,i.detail);
-    if(!i.ok){show('err',i.detail);refresh();return}
+    logStep('install backend',i.ok,i.detail,i.guide);
+    if(!i.ok){show('err',i.detail+' — follow the steps below.');refresh();return}
     const s=await (await fetch('/api/backend/start',{method:'POST'})).json();
-    logStep('start backend',s.ok,s.detail);
-    show(s.ok?'ok':'err',s.ok?'Backend is running.':s.detail);
+    logStep('start backend',s.ok,s.detail,s.guide);
+    show(s.ok?'ok':'err',s.ok?'Backend is running.':s.detail+' — follow the steps below.');
   }catch(e){show('err','Could not set up the backend: '+e)}
   refresh();
 }
@@ -1172,10 +1463,10 @@ async function fixUefn(){
   clearLog();show('ok','Writing UEFN settings…');
   try{
     const r=await (await fetch('/api/uefn/fix',{method:'POST'})).json();
-    r.results.forEach(s=>logStep(s.step,s.ok,s.detail));
+    r.results.forEach(s=>logStep(s.step,s.ok,s.detail,s.guide));
     show(r.ok?'ok':'err',r.ok
       ?'UEFN configured. Restart UEFN with your project open, then Re-check.'
-      :'Some UEFN settings could not be written — see the log.');
+      :'Some UEFN settings could not be written — follow the steps below.');
   }catch(e){show('err','Could not write UEFN settings: '+e)}
   refresh();
 }
@@ -1315,10 +1606,12 @@ def main(argv=None) -> int:
     if not back_ok and not args.no_autostart:
         def autostart():
             print("  Starting the agent backend...")
-            started, detail = start_backend()
-            print(f"  backend    {'running' if started else 'FAILED (' + detail + ')'}")
-            if not started:
-                print("  Start it from the app window, or run:  agent-canvas --backend-only")
+            result = start_backend()
+            print(f"  backend    {'running' if result['ok'] else 'FAILED (' + result['detail'] + ')'}")
+            if not result["ok"]:
+                guide = result.get("guide") or {}
+                for index, line in enumerate(guide.get("steps", []), 1):
+                    print(f"    {index}. {line}")
             print()
 
         threading.Thread(target=autostart, daemon=True).start()

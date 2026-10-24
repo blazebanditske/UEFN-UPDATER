@@ -70,6 +70,15 @@ jobs:
           echo "UI served OK"
           curl -s --max-time 10 http://127.0.0.1:8799/api/status | grep -q "workspace"
           echo "API responded OK"
+          # The reported Windows bug was a bare "npm" reaching subprocess; the
+          # fix makes the app resolve the .cmd shim. Prove the shipped binary
+          # ships the guide machinery too. fix-all itself is exercised by the
+          # pytest suite above -- it is deliberately not called here, because on
+          # Windows it would run a real `npm install -g`.
+          curl -s --max-time 10 http://127.0.0.1:8799/api/status | grep -q '"guide"'
+          echo "status guides present OK"
+          curl -s --max-time 10 http://127.0.0.1:8799/ | grep -q "renderGuide"
+          echo "UI ships the guide renderer OK"
           kill $APP_PID 2>/dev/null || true
 
       - name: Upload artifact

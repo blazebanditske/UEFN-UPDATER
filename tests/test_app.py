@@ -143,9 +143,10 @@ class BackendStartTests(unittest.TestCase):
         app.probe_backend = lambda: (False, "not running")
         app.find_agent_canvas = lambda: None
         try:
-            ok, detail = app.start_backend()
-            self.assertFalse(ok)
-            self.assertIn("agent-canvas", detail)
+            result = app.start_backend()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "backend_missing")
+            self.assertTrue(result["guide"]["steps"])
         finally:
             app.probe_backend = original_probe
             app.find_agent_canvas = original_find
@@ -165,9 +166,9 @@ class BackendStartTests(unittest.TestCase):
         app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
         app.subprocess.Popen = lambda *a, **k: calls.append(a)
         try:
-            ok, detail = app.start_backend()
-            self.assertTrue(ok)
-            self.assertIn("already", detail)
+            result = app.start_backend()
+            self.assertTrue(result["ok"])
+            self.assertIn("already", result["detail"])
             self.assertEqual(calls, [], "must not spawn a second agent-canvas")
         finally:
             app.probe_backend = original_probe
@@ -182,13 +183,220 @@ class BackendStartTests(unittest.TestCase):
         app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
         app.port_in_use = lambda p: True
         try:
-            ok, detail = app.start_backend()
-            self.assertFalse(ok)
-            self.assertIn("in use", detail)
+            result = app.start_backend()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "backend_port_busy")
+            self.assertIn("in use", result["detail"])
         finally:
             app.probe_backend = original_probe
             app.find_agent_canvas = original_find
             app.port_in_use = original_inuse
+
+
+class WindowsCommandResolutionTests(unittest.TestCase):
+    """Regression: on Windows npm/node are .cmd shims.
+
+    Passing the bare string "npm" to subprocess raises `[WinError 2] The system
+    cannot find the file specified`, because CreateProcess only appends `.exe`
+    and will not run a batch file by bare name. This was the reported bug:
+    "install backend — could not run npm: [WinError 2] ...".
+    """
+
+    def test_resolves_cmd_shim_when_bare_name_misses(self):
+        original = app.shutil.which
+        seen = []
+
+        def fake_which(name):
+            seen.append(name)
+            # Simulate Windows: only the .cmd shim exists.
+            return "C:\\nodejs\\npm.cmd" if name == "npm.cmd" else None
+
+        app.shutil.which = fake_which
+        original_nt = app.IS_WINDOWS
+        app.IS_WINDOWS = True
+        try:
+            resolved = app.resolve_command("npm")
+            self.assertEqual(resolved, "C:\\nodejs\\npm.cmd")
+            self.assertIn("npm.cmd", seen)
+        finally:
+            app.shutil.which = original
+            app.IS_WINDOWS = original_nt
+
+    def test_resolution_is_a_no_op_off_windows(self):
+        original_which = app.shutil.which
+        original_nt = app.IS_WINDOWS
+        app.shutil.which = lambda name: "/usr/bin/npm" if name == "npm" else None
+        app.IS_WINDOWS = False
+        try:
+            self.assertEqual(app.resolve_command("npm"), "/usr/bin/npm")
+        finally:
+            app.shutil.which = original_which
+            app.IS_WINDOWS = original_nt
+
+    def test_falls_back_to_the_name_when_nothing_is_found(self):
+        original = app.shutil.which
+        app.shutil.which = lambda name: None
+        try:
+            # Returning the bare name keeps the error message meaningful
+            # instead of launching an empty path.
+            self.assertEqual(app.resolve_command("npm"), "npm")
+        finally:
+            app.shutil.which = original
+
+    def test_npm_command_prefers_a_real_path(self):
+        original = app.shutil.which
+        app.shutil.which = lambda name: "C:\\nodejs\\npm.cmd" if name == "npm.cmd" else None
+        try:
+            self.assertEqual(app.npm_command(), "C:\\nodejs\\npm.cmd")
+        finally:
+            app.shutil.which = original
+
+    def test_npm_command_is_empty_when_absent(self):
+        original = app.shutil.which
+        app.shutil.which = lambda name: None
+        try:
+            self.assertEqual(app.npm_command(), "")
+        finally:
+            app.shutil.which = original
+
+    def test_install_never_passes_a_bare_npm_to_subprocess(self):
+        """The exact reported failure: subprocess must get a resolved path."""
+        original_which = app.shutil.which
+        original_find = app.find_agent_canvas
+        original_prefix = app.npm_global_prefix
+        original_run = app.subprocess.run
+        original_nt = app.IS_WINDOWS
+        captured = []
+
+        def fake_which(name):
+            return "C:\\nodejs\\npm.cmd" if name == "npm.cmd" else None
+
+        class Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(argv, **kwargs):
+            captured.append(argv)
+            return Done()
+
+        app.shutil.which = fake_which
+        app.find_agent_canvas = lambda: "C:\\nodejs\\agent-canvas.cmd"
+        app.npm_global_prefix = lambda: None
+        app.subprocess.run = fake_run
+        app.IS_WINDOWS = True
+        try:
+            result = app.install_backend_dependencies()
+            self.assertTrue(result["ok"], result["detail"])
+            self.assertEqual(captured, [], "already installed, should not shell out")
+
+            # Now simulate the package being missing so npm actually runs.
+            captured.clear()
+            app.find_agent_canvas = lambda: None
+            result = app.install_backend_dependencies()
+            self.assertEqual(len(captured), 1)
+            argv = captured[0]
+            self.assertEqual(argv[0], "C:\\nodejs\\npm.cmd",
+                             "must pass the resolved .cmd, not bare 'npm'")
+            self.assertNotEqual(argv[0], "npm")
+        finally:
+            app.shutil.which = original_which
+            app.find_agent_canvas = original_find
+            app.npm_global_prefix = original_prefix
+            app.subprocess.run = original_run
+            app.IS_WINDOWS = original_nt
+
+
+class GuideCoverageTests(unittest.TestCase):
+    """Every failure code the app can emit must have a usable guide."""
+
+    def test_all_guides_are_well_formed(self):
+        self.assertTrue(app.GUIDES)
+        for code, guide in app.GUIDES.items():
+            with self.subTest(code=code):
+                self.assertTrue(guide["title"])
+                self.assertTrue(guide["steps"], "a guide with no steps is useless")
+                self.assertTrue(guide["done"])
+                for line in guide["steps"]:
+                    self.assertTrue(line.strip())
+
+    def test_unknown_code_still_returns_a_guide(self):
+        guide = app.guide_for("does-not-exist")
+        self.assertTrue(guide["title"])
+        self.assertTrue(guide["steps"])
+
+    def test_ok_result_has_no_guide(self):
+        self.assertIsNone(app.ok_result("fine")["guide"])
+        self.assertTrue(app.ok_result("fine")["ok"])
+
+    def test_fail_result_always_has_a_guide(self):
+        result = app.fail_result("npm_missing", "boom")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "npm_missing")
+        self.assertTrue(result["guide"]["steps"])
+
+    def test_backend_code_distinguishes_missing_from_stopped(self):
+        original = app.find_agent_canvas
+        app.find_agent_canvas = lambda: None
+        try:
+            self.assertEqual(app.backend_failure_code(), "backend_missing")
+        finally:
+            app.find_agent_canvas = original
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        try:
+            self.assertEqual(app.backend_failure_code(), "backend_stopped")
+        finally:
+            app.find_agent_canvas = original
+
+    def test_every_backend_and_uefn_failure_code_is_covered(self):
+        """Pin the codes the code paths actually raise."""
+        expected = {
+            "npm_missing", "npm_unwritable", "npm_failed", "npm_error",
+            "backend_missing", "backend_stopped", "backend_port_busy",
+            "backend_timeout", "backend_error",
+            "uefn_ini_missing", "uefn_ini_unwritable",
+            "uefn_project_missing", "uefn_project_unreadable",
+            "uefn_project_unwritable", "uefn_not_connected", "model_missing",
+        }
+        self.assertEqual(expected - set(app.GUIDES), set())
+
+
+class StatusGuideTests(unittest.TestCase):
+    """A red row in /api/status must carry its own repair steps."""
+
+    def _status(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/status", timeout=15) as r:
+                return json.loads(r.read().decode())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_failing_rows_expose_a_guide(self):
+        original_uefn = app.probe_uefn
+        original_back = app.probe_backend
+        original_llm = app.llm_status
+        original_find = app.find_agent_canvas
+        app.probe_uefn = lambda url: (False, "nothing listening")
+        app.probe_backend = lambda: (False, "not running")
+        app.llm_status = lambda: (False, "no key")
+        app.find_agent_canvas = lambda: None
+        try:
+            body = self._status()
+        finally:
+            app.probe_uefn = original_uefn
+            app.probe_backend = original_back
+            app.llm_status = original_llm
+            app.find_agent_canvas = original_find
+        for key in ("uefn", "backend", "llm"):
+            self.assertFalse(body[key]["ok"], key)
+            guide = body[key]["guide"]
+            self.assertTrue(guide, f"{key} row has no guide")
+            self.assertTrue(guide["steps"])
 
 
 class PageTests(unittest.TestCase):
@@ -391,7 +599,7 @@ class StartupTests(unittest.TestCase):
         def blocking_start_backend(port=None):
             blocked.set()
             release.wait(timeout=15)  # stand in for a slow backend
-            return True, "running"
+            return app.ok_result("running")
 
         orig_probe, orig_start = app.probe_backend, app.start_backend
         app.probe_backend = lambda: (False, "not running")
@@ -423,6 +631,13 @@ class StartupTests(unittest.TestCase):
         self.assertLess(autostart_at, serve_at,
                         "autostart must be defined before the serve loop, "
                         "and run on its own thread")
+
+    def test_cli_autostart_prints_the_guide_on_failure(self):
+        """A failed CLI autostart must print the numbered repair, not a bare error."""
+        src = open(os.path.join(ROOT, "uefn_link_app.py")).read()
+        body = src.split("def main(", 1)[1]
+        self.assertIn('guide.get("steps", [])', body)
+        self.assertIn("result['ok']", body)
 
 
 class UefnConfigTests(unittest.TestCase):
@@ -478,8 +693,8 @@ class UefnConfigTests(unittest.TestCase):
         original = app.uefn_ini_path
         app.uefn_ini_path = lambda: ini
         try:
-            ok, detail = app.configure_uefn_autostart()
-            self.assertTrue(ok, detail)
+            result = app.configure_uefn_autostart()
+            self.assertTrue(result["ok"], result["detail"])
             self.assertTrue(os.path.exists(ini + ".uefn-link.bak"))
             with open(ini, encoding="utf-8") as fh:
                 body = fh.read()
@@ -492,9 +707,9 @@ class UefnConfigTests(unittest.TestCase):
         original = app.uefn_ini_path
         app.uefn_ini_path = lambda: os.path.join(self.tmp, "nope.ini")
         try:
-            ok, detail = app.configure_uefn_autostart()
-            self.assertFalse(ok)
-            self.assertIn("not found", detail)
+            result = app.configure_uefn_autostart()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "uefn_ini_missing")
         finally:
             app.uefn_ini_path = original
 
@@ -518,8 +733,8 @@ class ProjectFlagTests(unittest.TestCase):
     def test_sets_both_beta_flags(self):
         root, path = self._make_project({"dataSets": {}})
         try:
-            ok, detail = app.enable_project_beta_flags(root)
-            self.assertTrue(ok, detail)
+            result = app.enable_project_beta_flags(root)
+            self.assertTrue(result["ok"], result["detail"])
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
             exp = data["dataSets"]["experimental"]
@@ -544,9 +759,9 @@ class ProjectFlagTests(unittest.TestCase):
         root, _ = self._make_project({"dataSets": {}})
         try:
             app.enable_project_beta_flags(root)
-            ok, detail = app.enable_project_beta_flags(root)
-            self.assertTrue(ok)
-            self.assertIn("already", detail)
+            result = app.enable_project_beta_flags(root)
+            self.assertTrue(result["ok"])
+            self.assertIn("already", result["detail"])
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -555,9 +770,9 @@ class ProjectFlagTests(unittest.TestCase):
         try:
             with open(os.path.join(root, ".uefnproject"), "w", encoding="utf-8") as fh:
                 fh.write("{not json")
-            ok, detail = app.enable_project_beta_flags(root)
-            self.assertFalse(ok)
-            self.assertIn("could not read", detail)
+            result = app.enable_project_beta_flags(root)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "uefn_project_unreadable")
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -604,17 +819,7 @@ class FixAllTests(unittest.TestCase):
     """fix-all must keep going after a failure so the user sees every problem,
     and must never claim success while the credential is missing."""
 
-    def test_reports_manual_step_when_no_key(self):
-        tmp = tempfile.mkdtemp()
-        patches = {
-            "install_backend_dependencies": lambda progress=None: (True, "installed"),
-            "start_backend": lambda port=None: (True, "started"),
-            "configure_uefn_autostart": lambda: (True, "ini ok"),
-            "enable_project_beta_flags": lambda project=None: (True, "flags ok"),
-            "probe_uefn": lambda url: (True, "connected"),
-            "llm_status": lambda: (False, "no key"),
-            "WORKSPACE_DIR": tmp,
-        }
+    def _run_fix_all(self, patches, tmp):
         originals = {k: getattr(app, k) for k in patches}
         for k, v in patches.items():
             setattr(app, k, v)
@@ -625,19 +830,73 @@ class FixAllTests(unittest.TestCase):
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/api/fix-all", method="POST", data=b"")
             with urllib.request.urlopen(req, timeout=20) as resp:
-                body = json.loads(resp.read().decode())
-            server.shutdown()
-            server.server_close()
-            self.assertFalse(body["ok"])
-            self.assertIn("model credential", body["needs"])
-            manual = [s for s in body["steps"] if s["step"] == "model credential"][0]
-            self.assertTrue(manual["manual"])
-            # Every other step still ran and reported.
-            self.assertGreaterEqual(len(body["steps"]), 6)
+                return json.loads(resp.read().decode())
         finally:
             for k, v in originals.items():
                 setattr(app, k, v)
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_reports_manual_step_when_no_key(self):
+        tmp = tempfile.mkdtemp()
+        body = self._run_fix_all({
+            "install_backend_dependencies": lambda progress=None: app.ok_result("installed"),
+            "start_backend": lambda port=None: app.ok_result("started"),
+            "configure_uefn_autostart": lambda: app.ok_result("ini ok"),
+            "enable_project_beta_flags": lambda project=None: app.ok_result("flags ok"),
+            "probe_uefn": lambda url: (True, "connected"),
+            "llm_status": lambda: (False, "no key"),
+            "WORKSPACE_DIR": tmp,
+        }, tmp)
+        self.assertFalse(body["ok"])
+        self.assertIn("model credential", body["needs"])
+        manual = [s for s in body["steps"] if s["step"] == "model credential"][0]
+        self.assertTrue(manual["manual"])
+        # Every other step still ran and reported.
+        self.assertGreaterEqual(len(body["steps"]), 6)
+
+    def test_every_failed_step_carries_a_step_by_step_guide(self):
+        """A red dot must always say how to clear it."""
+        tmp = tempfile.mkdtemp()
+        body = self._run_fix_all({
+            "install_backend_dependencies": lambda progress=None: app.fail_result(
+                "npm_missing", "npm was not found"),
+            "start_backend": lambda port=None: app.fail_result(
+                "backend_missing", "agent-canvas is not installed"),
+            "configure_uefn_autostart": lambda: app.fail_result(
+                "uefn_ini_missing", "no preferences file"),
+            "enable_project_beta_flags": lambda project=None: app.fail_result(
+                "uefn_project_missing", "no project folder"),
+            "probe_uefn": lambda url: (False, "nothing listening"),
+            "llm_status": lambda: (False, "no key"),
+            "WORKSPACE_DIR": tmp,
+        }, tmp)
+        self.assertFalse(body["ok"])
+        failed = [s for s in body["steps"] if not s["ok"]]
+        self.assertEqual(len(failed), 6, "all six steps should have failed")
+        for step in failed:
+            guide = step["guide"]
+            self.assertTrue(guide, f"{step['step']} has no guide")
+            self.assertTrue(guide["title"], f"{step['step']} guide has no title")
+            self.assertTrue(guide["steps"], f"{step['step']} guide has no steps")
+            self.assertTrue(guide["done"], f"{step['step']} guide has no 'done'")
+            for line in guide["steps"]:
+                self.assertIsInstance(line, str)
+                self.assertTrue(line.strip())
+
+    def test_guides_are_not_leaked_onto_passing_steps(self):
+        tmp = tempfile.mkdtemp()
+        body = self._run_fix_all({
+            "install_backend_dependencies": lambda progress=None: app.ok_result("installed"),
+            "start_backend": lambda port=None: app.ok_result("started"),
+            "configure_uefn_autostart": lambda: app.ok_result("ini ok"),
+            "enable_project_beta_flags": lambda project=None: app.ok_result("flags ok"),
+            "probe_uefn": lambda url: (True, "connected"),
+            "llm_status": lambda: (True, "model set"),
+            "WORKSPACE_DIR": tmp,
+        }, tmp)
+        self.assertTrue(body["ok"])
+        for step in body["steps"]:
+            self.assertIsNone(step["guide"], step["step"])
 
 
 class StatusPayloadTests(unittest.TestCase):

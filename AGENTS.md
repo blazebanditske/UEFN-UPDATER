@@ -128,6 +128,15 @@ These cost real debugging time to establish. Do not re-derive them.
   `/usr/local` (not writable); on Windows it is `%APPDATA%\npm` (writable). The
   installer checks `os.access(prefix, os.W_OK)` and, if it fails, prints the
   `npm config set prefix` fix rather than npm's raw EACCES wall.
+- **Never hand a bare tool name to `subprocess`.** On Windows `npm`, `node`, and
+  `agent-canvas` are `.cmd`/`.bat` shims. `shutil.which` finds them, but
+  `CreateProcess` only auto-appends `.exe`, so `subprocess.run(["npm", ...])`
+  dies with `[WinError 2] The system cannot find the file specified` — which is
+  exactly how the app reported it (`install backend — could not run npm:
+  [WinError 2] ...`). Route every spawn through `resolve_command(name)`, which
+  tries the bare name then `.cmd`/`.exe`/`.bat` when `IS_WINDOWS`. `IS_WINDOWS`
+  is a module constant, not `os.name` at the call site, so tests can drive both
+  branches on any platform.
 - `POST /api/conversations` **requires** `agent.llm` (model, api_key, base_url).
   Omitting it is HTTP 422. Omitting `agent` entirely is also 422.
 - The session key at `~/.openhands/agent-canvas/api-key.txt` authorizes the
@@ -165,4 +174,28 @@ What `POST /api/uefn/fix` writes, and why it is safe to write.
   that gate in code — report it. The app's fix-all says so explicitly rather
   than claiming success.
 
+## The failure-guide contract
 
+Every failure the app can surface must tell the user how to clear it. This is a
+hard rule, not a nicety: the target user double-clicks an exe and never sees a
+terminal.
+
+- `install_backend_dependencies`, `start_backend`, `configure_uefn_autostart`,
+  and `enable_project_beta_flags` return a **dict**, never a tuple. Build it with
+  `ok_result(detail)` or `fail_result(code, detail, **extra)`.
+- A failure dict carries `ok`, `code`, `detail`, and `guide`. `guide_for(code)`
+  looks the code up in `GUIDES`; an unknown code still yields a generic guide, so
+  a missed entry degrades to "press Fix everything" instead of a dead end.
+- A guide is `{title, steps, done}`: what went wrong, an ordered repair, and the
+  observable state that means it worked. `steps` is always non-empty.
+- Passing results carry `guide: None`. Do not attach a repair to a green row.
+- `/api/status` attaches a guide to each red row, so the window explains itself
+  before the user presses anything. The backend row uses `backend_failure_code()`
+  to distinguish *not installed* from *installed but stopped* — different
+  repairs, and the app can tell them apart for free.
+- The page renders guides through one `renderGuide()` used by both the status
+  card and the fix log. Add new UI surfaces through it rather than formatting
+  steps inline.
+
+When you add a failure path, add its code to `GUIDES` and to the expected set in
+`tests/test_app.py::GuideCoverageTests`; that test fails on an uncovered code.
