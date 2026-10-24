@@ -30,9 +30,10 @@ import urllib.error
 import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 APP_NAME = "UEFN Link"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 DEFAULT_APP_PORT = 8765
 UEFN_MCP_URL = os.environ.get("UEFN_MCP_URL", "http://127.0.0.1:8000/mcp")
 # UEFN's embedded MCP server owns 8000 by default. The agent backend must not
@@ -259,8 +260,39 @@ def resolve_command(name: str) -> str:
 
 
 def npm_command() -> str:
-    """Resolved npm. Empty string means npm is genuinely not installed."""
-    return which_any("npm", "npm.cmd", "npm.exe") or ""
+    """Resolved npm. Empty string means npm is genuinely not installed.
+
+    Prefer npm.cmd on Windows. Node also ships npm.ps1, and PowerShell refuses
+    to load it under its default Restricted policy; the app must never pick that
+    one, or a spawn fails for a reason that has nothing to do with npm.
+    """
+    if IS_WINDOWS:
+        return which_any("npm.cmd", "npm.exe", "npm") or ""
+    return which_any("npm") or ""
+
+
+# PowerShell refuses to load npm.ps1 under its default Restricted policy, so a
+# command that works in Command Prompt dies in PowerShell before npm ever runs.
+# These markers identify that specific wall in npm's output.
+POWERSHELL_BLOCK_MARKERS = (
+    "running scripts is disabled",
+    "pssecurityexception",
+    "unauthorizedaccess",
+    "cannot be loaded because running scripts",
+)
+
+
+def npm_failure_code(output: str) -> str:
+    """Pick the guide that explains an npm failure.
+
+    The common Windows case is not npm's fault at all: PowerShell will not load
+    its npm.ps1 shim, so the install never starts. Recognizing that lets the app
+    say "use Command Prompt" instead of printing PowerShell's raw security text.
+    """
+    lowered = (output or "").lower()
+    if any(marker in lowered for marker in POWERSHELL_BLOCK_MARKERS):
+        return "npm_powershell_blocked"
+    return "npm_failed"
 
 
 def npm_global_prefix() -> str | None:
@@ -320,12 +352,42 @@ def environment_report() -> dict:
 
 
 # --- failure guides --------------------------------------------------------
+def backend_port() -> int:
+    """The ingress port the backend actually runs on.
+
+    The app talks to BACKEND_URL, which honors LOCAL_AGENT_SERVER_URL. Any
+    command the app tells the user to paste must name the same port, or the
+    backend starts somewhere the app is not looking -- or, worse, on UEFN's own
+    port 8000, which is the default agent-canvas picks when given no --port.
+    """
+    try:
+        return urlparse(BACKEND_URL).port or DEFAULT_BACKEND_PORT
+    except ValueError:
+        return DEFAULT_BACKEND_PORT
+
+
+def backend_start_command() -> str:
+    """The exact command a user can paste to start the backend by hand.
+
+    Always carries --port. Without it agent-canvas defaults to 8000 and
+    collides with UEFN's embedded MCP server, which is the failure this
+    command exists to fix.
+    """
+    return f"agent-canvas --backend-only --port {backend_port()}"
+
+
 # Every failure the app can produce carries a step-by-step repair. These are
 # written for someone who does not want to read a stack trace: numbered steps,
 # the exact command to paste, and what "done" looks like. The UI renders these
 # on the failed row, so a red dot always explains itself.
 def _guide(title: str, *steps: str, done: str = "") -> dict:
     return {"title": title, "steps": [s for s in steps if s], "done": done}
+
+
+# Guides quote the start command, which depends on the backend port. The port is
+# fixed by BACKEND_URL at import, but LOCAL_AGENT_SERVER_URL can override it, so
+# substitute at read time rather than freezing the value into the registry.
+_START_CMD = "\x00START_CMD\x00"
 
 
 GUIDES = {
@@ -342,8 +404,8 @@ GUIDES = {
     "npm_unwritable": _guide(
         "npm's global folder is not writable",
         "Close this app.",
-        "Right-click your terminal (Command Prompt or PowerShell) and choose "
-        "Run as administrator.",
+        "Open Command Prompt as administrator: press the Windows key, type "
+        "cmd, right-click Command Prompt, and choose Run as administrator.",
         "Run:  npm config set prefix \"%APPDATA%\\npm\"",
         "Close the terminal, then start this app normally.",
         "Press Fix everything.",
@@ -353,8 +415,11 @@ GUIDES = {
     "npm_failed": _guide(
         "The agent-canvas install did not finish",
         "Check your internet connection.",
-        "Open a terminal and run:  npm install -g @openhands/agent-canvas",
+        "Open Command Prompt (press the Windows key, type cmd) — not "
+        "PowerShell — and run:  npm install -g @openhands/agent-canvas",
         "If it prints a permission error, follow the 'not writable' steps.",
+        "If PowerShell refuses to run npm, follow the 'PowerShell is "
+        "blocking npm' steps instead.",
         "If it prints a network error, retry — npm downloads a few MB.",
         "When it succeeds, press Fix everything again.",
         done="A global agent-canvas binary exists and `agent-canvas --version` runs.",
@@ -364,14 +429,26 @@ GUIDES = {
         "Close this app completely.",
         "Start it again. The app re-resolves npm on every launch.",
         "Press Fix everything.",
-        "If it still fails, open a terminal and run:  npm --version",
+        "If it still fails, open Command Prompt (not PowerShell) and run:  "
+        "npm --version",
         "If that also fails, reinstall Node.js from https://nodejs.org.",
         done="`npm --version` prints a version number.",
+    ),
+    "npm_powershell_blocked": _guide(
+        "PowerShell is blocking npm",
+        "This is not an npm problem. PowerShell refuses to load npm's script "
+        "because its execution policy is Restricted.",
+        "Open Command Prompt instead: press the Windows key, type cmd, and "
+        "press Enter. Do not use PowerShell or a PowerShell tab.",
+        "In that window run:  npm install -g @openhands/agent-canvas",
+        "When it finishes, close this app completely and start it again.",
+        "Press Fix everything.",
+        done="The Agent backend row turns green.",
     ),
     "backend_missing": _guide(
         "The agent backend is not installed",
         "Press the Fix button on the Agent backend row.",
-        "If that fails, open a terminal and run:  "
+        "If that fails, open Command Prompt (not PowerShell) and run:  "
         "npm install -g @openhands/agent-canvas",
         "Wait for it to finish — it downloads a few MB.",
         "Press Fix everything.",
@@ -382,8 +459,7 @@ GUIDES = {
         "Press Fix everything. The app starts it for you.",
         "If it stays red, open Task Manager (Ctrl+Shift+Esc) and end any "
         "agent-canvas process, then press Fix everything again.",
-        "If it still stays red, open a terminal and run:  "
-        "agent-canvas --backend-only",
+        "If it still stays red, open a terminal and run:  " + _START_CMD,
         "Leave that terminal open while you use this app.",
         done="The Agent backend row turns green.",
     ),
@@ -406,8 +482,18 @@ GUIDES = {
         "The backend could not be started",
         "Close any other window of this app.",
         "Press Fix everything.",
-        "If it still fails, open a terminal and run:  agent-canvas --backend-only",
+        "If it still fails, open a terminal and run:  " + _START_CMD,
         "Read the last few lines it prints — they name the cause.",
+        done="The Agent backend row turns green.",
+    ),
+    "backend_port_conflict": _guide(
+        "agent-canvas was started on a port UEFN already owns",
+        "Close any agent-canvas window or terminal you opened by hand.",
+        "Press Fix everything. The app starts the backend on its own port "
+        f"({DEFAULT_BACKEND_PORT}), never on UEFN's 8000.",
+        "Never run agent-canvas without --port: it defaults to 8000 and "
+        "collides with UEFN's MCP server.",
+        "If you must start it by hand, run:  " + _START_CMD,
         done="The Agent backend row turns green.",
     ),
     "uefn_ini_missing": _guide(
@@ -475,7 +561,15 @@ GUIDES = {
 
 
 def guide_for(code: str) -> dict:
-    return GUIDES.get(code, _guide("Something went wrong", "Press Fix everything to retry."))
+    """Look up the repair for a failure code, with the real start command filled in."""
+    guide = GUIDES.get(code) or _guide(
+        "Something went wrong", "Press Fix everything to retry.")
+    command = backend_start_command()
+    return {
+        "title": guide["title"],
+        "steps": [s.replace(_START_CMD, command) for s in guide["steps"]],
+        "done": guide["done"],
+    }
 
 
 def backend_failure_code() -> str:
@@ -542,8 +636,10 @@ def install_backend_dependencies(progress=None) -> dict:
         return fail_result("npm_error", f"could not run npm: {exc}")
 
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip()[-400:]
-        return fail_result("npm_failed", f"npm install failed: {tail}")
+        combined = (proc.stderr or "") + (proc.stdout or "")
+        tail = combined.strip()[-400:]
+        return fail_result(
+            npm_failure_code(combined), f"npm install failed: {tail}")
 
     if not find_agent_canvas():
         return fail_result(
@@ -861,7 +957,23 @@ def llm_status() -> tuple[bool, str]:
     return True, llm["model"]
 
 
-def start_backend(port: int = DEFAULT_BACKEND_PORT) -> dict:
+def backend_log_since(log_path: str, start: int, limit: int = 4000) -> str:
+    """Output written to the backend log at or after `start`, capped to `limit`.
+
+    Only this launch's output is considered, so a stale "port in use" line from
+    an earlier attempt cannot mislabel a fresh failure.
+    """
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(start, size - limit))
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def start_backend(port: int | None = None) -> dict:
     """Start `agent-canvas --backend-only` and wait for it to answer.
 
     The editor's MCP server is loopback-only, so the agent has to run on this
@@ -870,6 +982,10 @@ def start_backend(port: int = DEFAULT_BACKEND_PORT) -> dict:
     unrelated process is reported rather than worked around, because
     agent-canvas also claims fixed internal ports.
     """
+    # Default to the port the app actually probes, so the process we spawn and
+    # the URL we read can never disagree.
+    port = backend_port() if port is None else port
+
     # Already up? Do not start a second instance. agent-canvas also binds
     # internal ports (agent-server 18000, automation 18001) that a running
     # instance already holds, so a second launch fails no matter which ingress
@@ -896,6 +1012,9 @@ def start_backend(port: int = DEFAULT_BACKEND_PORT) -> dict:
 
     log_path = os.path.join(WORKSPACE_DIR, "backend.log")
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    # Record where this launch begins so the tail we read on failure is ours,
+    # not output from a previous attempt.
+    log_offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
     try:
         with open(log_path, "ab") as log:
             subprocess.Popen(
@@ -915,6 +1034,18 @@ def start_backend(port: int = DEFAULT_BACKEND_PORT) -> dict:
         if ok:
             return ok_result("started")
         time.sleep(2)
+
+    # It died or hung. The common cause is a port already claimed by a
+    # hand-started agent-canvas (its default ingress is UEFN's own 8000), which
+    # names itself in the log. Read the log so the app can say which repair
+    # applies instead of a generic timeout.
+    tail = backend_log_since(log_path, log_offset)
+    if "already in use" in tail.lower():
+        return fail_result(
+            "backend_port_conflict",
+            f"agent-canvas could not bind its ports — something is already "
+            f"using them (see {log_path}).",
+        )
     return fail_result(
         "backend_timeout",
         f"started but not answering after 90s (see {log_path})",
@@ -1177,7 +1308,8 @@ class AppHandler(BaseHTTPRequestHandler):
         if not back_ok:
             return self._json(400, {
                 "error": f"The agent backend is not available ({back_detail}).",
-                "fix": "Press 'Start backend' above, or run:  agent-canvas --backend-only",
+                "fix": "Press 'Start backend' above, or run:  "
+                       + backend_start_command(),
             })
 
         llm = resolve_llm()

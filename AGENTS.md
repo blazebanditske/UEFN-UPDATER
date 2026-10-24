@@ -199,3 +199,26 @@ terminal.
 
 When you add a failure path, add its code to `GUIDES` and to the expected set in
 `tests/test_app.py::GuideCoverageTests`; that test fails on an uncovered code.
+
+
+## Windows shell and port facts
+
+- Never quote a portless agent-canvas command. agent-canvas defaults its ingress
+  to 8000, which is UEFN's own MCP port, so a portless start dies with "the
+  following ports are already in use: ingress: port 8000". Every command the app
+  shows the user, and every doc line, must carry `--port <backend_port()>`.
+  backend_start_command() builds that string and guide_for() substitutes it into
+  the guides, so the value always tracks BACKEND_URL (which
+  LOCAL_AGENT_SERVER_URL can override). start_backend defaults its port to
+  backend_port() too, so the process it spawns and the URL it probes cannot drift
+  apart. A test asserts no guide ever quotes a portless start command.
+- PowerShell cannot run npm by default. Windows ships npm as npm.cmd, npm.ps1,
+  and npm (a bash script). PowerShell resolves npm to npm.ps1 and refuses it
+  under the default Restricted policy: "File ...npm.ps1 cannot be loaded because
+  running scripts is disabled on this system". That is not an npm failure. The
+  app therefore (a) prefers npm.cmd in npm_command() and never the .ps1, and
+  (b) classifies the error text with npm_failure_code(), which routes it to the
+  npm_powershell_blocked guide that says "use Command Prompt". Every guide that
+  tells the user to run npm names Command Prompt explicitly. Do not suggest
+  Set-ExecutionPolicy as the fix: it weakens a machine-wide security setting to
+  work around a shell the app does not need.

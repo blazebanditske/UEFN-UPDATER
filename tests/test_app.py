@@ -245,11 +245,31 @@ class WindowsCommandResolutionTests(unittest.TestCase):
 
     def test_npm_command_prefers_a_real_path(self):
         original = app.shutil.which
+        original_nt = app.IS_WINDOWS
         app.shutil.which = lambda name: "C:\\nodejs\\npm.cmd" if name == "npm.cmd" else None
+        app.IS_WINDOWS = True
         try:
             self.assertEqual(app.npm_command(), "C:\\nodejs\\npm.cmd")
         finally:
             app.shutil.which = original
+            app.IS_WINDOWS = original_nt
+
+    def test_npm_command_never_picks_the_powershell_shim(self):
+        """PowerShell blocks npm.ps1, so the app must prefer npm.cmd."""
+        original = app.shutil.which
+        original_nt = app.IS_WINDOWS
+
+        def fake_which(name):
+            return {"npm.ps1": "C:\\nodejs\\npm.ps1",
+                    "npm.cmd": "C:\\nodejs\\npm.cmd"}.get(name)
+
+        app.shutil.which = fake_which
+        app.IS_WINDOWS = True
+        try:
+            self.assertEqual(app.npm_command(), "C:\\nodejs\\npm.cmd")
+        finally:
+            app.shutil.which = original
+            app.IS_WINDOWS = original_nt
 
     def test_npm_command_is_empty_when_absent(self):
         original = app.shutil.which
@@ -307,6 +327,121 @@ class WindowsCommandResolutionTests(unittest.TestCase):
             app.IS_WINDOWS = original_nt
 
 
+class BackendPortAndShellTests(unittest.TestCase):
+    """Regressions for the port collision and the PowerShell npm wall.
+
+    Two reported failures:
+      1. A hand-started agent-canvas on port 8000 (its default) collides with
+         UEFN's own MCP server, because a command quoted without --port lets
+         agent-canvas pick 8000.
+      2. PowerShell refuses to load npm.ps1 ("running scripts is disabled"), so
+         an install that works in Command Prompt dies before npm runs.
+    """
+
+    def test_start_command_always_names_the_backend_port(self):
+        command = app.backend_start_command()
+        self.assertIn("--port", command)
+        self.assertIn(str(app.backend_port()), command)
+        self.assertNotIn("8000", command)
+
+    def test_start_command_follows_the_configured_url(self):
+        original = app.BACKEND_URL
+        app.BACKEND_URL = "http://127.0.0.1:4321"
+        try:
+            self.assertEqual(app.backend_port(), 4321)
+            self.assertIn("4321", app.backend_start_command())
+        finally:
+            app.BACKEND_URL = original
+
+    def test_guides_never_quote_a_portless_start_command(self):
+        """A quoted command must be copy-pasteable without colliding on 8000."""
+        for code in app.GUIDES:
+            guide = app.guide_for(code)
+            for line in guide["steps"]:
+                if "agent-canvas --backend-only" in line:
+                    with self.subTest(code=code):
+                        self.assertIn("--port", line)
+
+    def test_start_backend_defaults_to_the_probed_port(self):
+        """The spawned port and the probed URL must agree."""
+        original_probe = app.probe_backend
+        original_canvas = app.find_agent_canvas
+        original_in_use = app.port_in_use
+        original_popen = app.subprocess.Popen
+        original_url = app.BACKEND_URL
+        captured = []
+
+        class FakeProc:
+            pass
+
+        def fake_popen(argv, **kwargs):
+            captured.append(argv)
+            return FakeProc()
+
+        app.BACKEND_URL = "http://127.0.0.1:4321"
+        app.probe_backend = lambda: (False, "nope")
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        app.port_in_use = lambda p: False
+        app.subprocess.Popen = fake_popen
+        try:
+            # Returns timeout after the wait loop; we only care about argv.
+            app.start_backend()
+        finally:
+            app.probe_backend = original_probe
+            app.find_agent_canvas = original_canvas
+            app.port_in_use = original_in_use
+            app.subprocess.Popen = original_popen
+            app.BACKEND_URL = original_url
+        self.assertEqual(len(captured), 1)
+        argv = captured[0]
+        self.assertIn("--port", argv)
+        self.assertEqual(argv[argv.index("--port") + 1], "4321",
+                         "must spawn on the port the app probes")
+
+    def test_powershell_block_is_classified(self):
+        stderr = ("npm : File C:\\Program Files\\nodejs\\npm.ps1 cannot be "
+                  "loaded because running scripts is disabled on this system.")
+        self.assertEqual(app.npm_failure_code(stderr), "npm_powershell_blocked")
+        self.assertIn("Command Prompt", app.GUIDES["npm_powershell_blocked"]["steps"][1])
+
+    def test_ordinary_npm_failure_stays_npm_failed(self):
+        self.assertEqual(app.npm_failure_code("EACCES: permission denied"),
+                         "npm_failed")
+
+    def test_install_reports_powershell_block_with_its_guide(self):
+        """The install must not print PowerShell's raw security error."""
+        original_which = app.shutil.which
+        original_find = app.find_agent_canvas
+        original_prefix = app.npm_global_prefix
+        original_run = app.subprocess.run
+        original_nt = app.IS_WINDOWS
+
+        def fake_which(name):
+            return "C:\nodejs\npm.cmd" if name == "npm.cmd" else None
+
+        class Failed:
+            returncode = 1
+            stdout = ""
+            stderr = "running scripts is disabled on this system"
+
+        app.shutil.which = fake_which
+        app.find_agent_canvas = lambda: None
+        app.npm_global_prefix = lambda: None
+        app.subprocess.run = lambda *a, **k: Failed()
+        app.IS_WINDOWS = True
+        try:
+            result = app.install_backend_dependencies()
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["code"], "npm_powershell_blocked")
+            self.assertTrue(result["guide"]["steps"])
+        finally:
+            app.shutil.which = original_which
+            app.find_agent_canvas = original_find
+            app.npm_global_prefix = original_prefix
+            app.subprocess.run = original_run
+            app.IS_WINDOWS = original_nt
+
+
 class GuideCoverageTests(unittest.TestCase):
     """Every failure code the app can emit must have a usable guide."""
 
@@ -352,8 +487,9 @@ class GuideCoverageTests(unittest.TestCase):
         """Pin the codes the code paths actually raise."""
         expected = {
             "npm_missing", "npm_unwritable", "npm_failed", "npm_error",
+            "npm_powershell_blocked",
             "backend_missing", "backend_stopped", "backend_port_busy",
-            "backend_timeout", "backend_error",
+            "backend_timeout", "backend_error", "backend_port_conflict",
             "uefn_ini_missing", "uefn_ini_unwritable",
             "uefn_project_missing", "uefn_project_unreadable",
             "uefn_project_unwritable", "uefn_not_connected", "model_missing",
