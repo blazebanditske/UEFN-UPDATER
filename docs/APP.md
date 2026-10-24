@@ -87,7 +87,7 @@ What **Fix everything** does, in order:
 | Step | What it does |
 | --- | --- |
 | install backend | Runs `npm install -g @openhands/agent-canvas` if it is missing |
-| start backend | Starts `agent-canvas --backend-only --port 3000` and waits for it to answer |
+| start backend | Starts `agent-canvas --backend-only --port 3010` and waits for it to answer |
 | UEFN auto-start | Writes `bAutoStartServer=True` into UEFN's editor preferences |
 | UEFN project flags | Turns on Python Editor Scripting and UEFN MCP Toolsets in `.uefnproject` |
 | UEFN connection | Checks the editor is actually answering |
@@ -131,7 +131,7 @@ The app starts this for you when it launches, and **Fix everything** installs
 and starts it if needed. To run it by hand:
 
 ```bash
-agent-canvas --backend-only --port 3000
+agent-canvas --backend-only --port 3010
 ```
 
 Install it first if needed: `npm install -g @openhands/agent-canvas`. On
@@ -140,13 +140,13 @@ default with "running scripts is disabled on this system".
 
 Always pass `--port`. Without it agent-canvas defaults to port 8000, which is
 where UEFN's own MCP server lives, and the two collide. The backend listens on
-port 3000 by default.
+port 3010 by default.
 
 > **One backend per machine.** agent-canvas also binds internal ports (18000
 > and 18001) that a running instance already holds, so a second copy fails no
 > matter which ingress port it is given. The app checks first and reuses a
 > healthy backend instead of starting a second one. If some other process holds
-> port 3000, the app says so rather than guessing.
+> port 3010, the app says so rather than guessing.
 
 **Model** — the account the agent bills and authenticates against.
 
@@ -303,7 +303,7 @@ is exposed to the network.
 | `GET /api/status` | probes UEFN, the backend, and the model config |
 | `POST /api/fix-all` | runs every automatic repair in order and reports each step |
 | `POST /api/backend/install` | `npm install -g @openhands/agent-canvas` |
-| `POST /api/backend/start` | starts `agent-canvas --backend-only --port 3000` and waits for it |
+| `POST /api/backend/start` | starts `agent-canvas --backend-only --port 3010` and waits for it |
 | `POST /api/uefn/fix` | writes UEFN's auto-start setting and the project beta flags |
 | `POST /api/llm/save` | saves a model key to `agent_settings.json` |
 | `POST /api/upload` | saves a file to `~/UEFN-Agent/uploads/` |
@@ -358,7 +358,7 @@ section, so a same-named key in another section is left alone.
 | --- | --- |
 | `UEFN: nothing listening` | UEFN closed, project not open, or the two project settings are off. Enable both and **restart UEFN**. |
 | `UEFN: HTTP 403` | Something else is on port 8000. Change UEFN's port in **Editor Preferences**, then set `UEFN_MCP_URL`. |
-| `backend: not running` | The app starts it automatically. If that failed, run `agent-canvas --backend-only --port 3000`, or press **Start backend**. |
+| `backend: not running` | The app starts it automatically. If that failed, run `agent-canvas --backend-only --port 3010`, or press **Start backend**. |
 | `backend: key rejected` | Stale key. Restart the backend; the app re-reads it. |
 | `Model dot red` | No LLM key. Run `openhands login`, or set `LLM_MODEL` and `LLM_API_KEY`. |
 | `login` succeeds but no key | The account has no credits, so BYOR key export is disabled (HTTP 402). Add credits, or use your own `LLM_API_KEY`. |

@@ -428,7 +428,7 @@ class BackendPortAndShellTests(unittest.TestCase):
         app.subprocess.Popen = lambda argv, **kwargs: (
             # Simulate the new process writing its own collision line.
             open(kwargs["stdout"].name, "a").write(
-                "Error: ingress: port 3000 already in use\n") or FakeProc())
+                "Error: ingress: port 3010 already in use\n") or FakeProc())
         try:
             result = app.start_backend()
         finally:

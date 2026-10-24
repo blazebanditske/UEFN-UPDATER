@@ -143,7 +143,7 @@ def cmd_check(args):
     print(f"  detail    {body}")
     print("\n  Fix: start a local backend on this machine:")
     print("           agent-canvas                  # UI + backend")
-    print("           agent-canvas --backend-only --port 3000   # backend only")
+    print("           agent-canvas --backend-only --port 3010   # backend only")
     print("\n  Note: a conversation on the OpenHands Cloud backend CANNOT reach")
     print("  UEFN. Its 127.0.0.1 is the cloud sandbox, not this machine.")
     return 1
@@ -179,7 +179,7 @@ def cmd_start(args):
     key = session_key()
     if not key:
         print("No local backend API key found.")
-        print("Start the backend first (`agent-canvas --backend-only --port 3000`), or set")
+        print("Start the backend first (`agent-canvas --backend-only --port 3010`), or set")
         print("LOCAL_BACKEND_API_KEY / OH_SESSION_API_KEY_PATH.")
         return 1
 

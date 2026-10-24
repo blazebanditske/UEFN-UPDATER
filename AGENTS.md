@@ -117,7 +117,7 @@ These cost real debugging time to establish. Do not re-derive them.
 - The local backend is `agent-canvas --backend-only` from
   `@openhands/agent-canvas` (npm). It serves the agent-server REST API.
 - It defaults to port **8000**, which collides with UEFN's own MCP server.
-  The app uses **3000**. Never point the backend at 8000.
+  The app uses **3010**. Never point the backend at 8000.
 - **Only one agent-canvas can run per machine.** Besides its ingress port it
   binds fixed internal ports (agent-server **18000**, automation **18001**), so a
   second launch dies with `Cannot start: the following ports are already in use`

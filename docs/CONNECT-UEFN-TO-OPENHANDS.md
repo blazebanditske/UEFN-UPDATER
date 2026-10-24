@@ -113,7 +113,7 @@ Agent backend (must run on THIS machine)
 ```
 
 If the backend line says `NO`, no agent can reach your project yet — start
-`agent-canvas --backend-only --port 3000` on this machine. That is Track A Step 6. The rest
+`agent-canvas --backend-only --port 3010` on this machine. That is Track A Step 6. The rest
 of this document explains what the script is checking and why.
 
 ---
@@ -303,7 +303,7 @@ This gives you the hosted interface with a local backend. UEFN stays loopback.
 1. On the UEFN machine, start the backend **as a backend only**:
 
    ```bash
-   agent-canvas --backend-only --port 3000
+   agent-canvas --backend-only --port 3010
    ```
 
    Always pass `--port`. agent-canvas defaults to `127.0.0.1:8000`, which is
@@ -590,7 +590,7 @@ Both settings required     Python Editor Scripting + UEFN MCP Toolsets
 Restart required           Yes, after enabling either setting
 Client check               uefn-link doctor
 Agent Canvas (local)       agent-canvas
-Agent Canvas (backend)     agent-canvas --backend-only --port 3000
+Agent Canvas (backend)     agent-canvas --backend-only --port 3010
 Add MCP (UI)               Customize > MCP Servers > Add custom server
 Add MCP (CLI)              openhands mcp add uefn --transport http http://127.0.0.1:8000/mcp
 MCP scope                  Per backend; new conversations only
