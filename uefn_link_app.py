@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "UEFN Link"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 DEFAULT_APP_PORT = 8765
 UEFN_MCP_URL = os.environ.get("UEFN_MCP_URL", "http://127.0.0.1:8000/mcp")
 # UEFN's embedded MCP server owns 8000 by default. The agent backend must not
