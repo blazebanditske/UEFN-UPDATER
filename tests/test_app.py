@@ -378,7 +378,9 @@ class BackendPortAndShellTests(unittest.TestCase):
             captured.append(argv)
             return FakeProc()
 
+        original_timeout = app.BACKEND_START_TIMEOUT
         app.BACKEND_URL = "http://127.0.0.1:4321"
+        app.BACKEND_START_TIMEOUT = 0.1
         app.probe_backend = lambda: (False, "nope")
         app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
         app.port_in_use = lambda p: False
@@ -392,11 +394,89 @@ class BackendPortAndShellTests(unittest.TestCase):
             app.port_in_use = original_in_use
             app.subprocess.Popen = original_popen
             app.BACKEND_URL = original_url
+            app.BACKEND_START_TIMEOUT = original_timeout
         self.assertEqual(len(captured), 1)
         argv = captured[0]
         self.assertIn("--port", argv)
         self.assertEqual(argv[argv.index("--port") + 1], "4321",
                          "must spawn on the port the app probes")
+
+    def test_start_backend_reports_a_port_conflict_from_this_launch_only(self):
+        """A stale 'in use' line from a prior launch must not mislabel a fresh
+        failure, and a fresh one must be reported as backend_port_conflict."""
+        original_canvas = app.find_agent_canvas
+        original_in_use = app.port_in_use
+        original_popen = app.subprocess.Popen
+        original_probe = app.probe_backend
+        original_timeout = app.BACKEND_START_TIMEOUT
+        original_workspace = app.WORKSPACE_DIR
+
+        workspace = tempfile.mkdtemp()
+        log_path = os.path.join(workspace, "backend.log")
+        # A previous launch left a port-in-use line in the log.
+        with open(log_path, "w") as fh:
+            fh.write("Error: ingress: port 8000 already in use\n")
+
+        class FakeProc:
+            pass
+
+        app.WORKSPACE_DIR = workspace
+        app.BACKEND_START_TIMEOUT = 0.1
+        app.probe_backend = lambda: (False, "nope")
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        app.port_in_use = lambda p: False
+        app.subprocess.Popen = lambda argv, **kwargs: (
+            # Simulate the new process writing its own collision line.
+            open(kwargs["stdout"].name, "a").write(
+                "Error: ingress: port 3000 already in use\n") or FakeProc())
+        try:
+            result = app.start_backend()
+        finally:
+            app.find_agent_canvas = original_canvas
+            app.port_in_use = original_in_use
+            app.subprocess.Popen = original_popen
+            app.probe_backend = original_probe
+            app.BACKEND_START_TIMEOUT = original_timeout
+            app.WORKSPACE_DIR = original_workspace
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "backend_port_conflict")
+        self.assertTrue(result["guide"]["steps"])
+
+    def test_stale_port_line_alone_does_not_fake_a_conflict(self):
+        """Only this launch's output counts: a stale line yields a timeout."""
+        original_canvas = app.find_agent_canvas
+        original_in_use = app.port_in_use
+        original_popen = app.subprocess.Popen
+        original_probe = app.probe_backend
+        original_timeout = app.BACKEND_START_TIMEOUT
+        original_workspace = app.WORKSPACE_DIR
+
+        workspace = tempfile.mkdtemp()
+        with open(os.path.join(workspace, "backend.log"), "w") as fh:
+            fh.write("Error: ingress: port 8000 already in use\n")
+
+        class FakeProc:
+            pass
+
+        app.WORKSPACE_DIR = workspace
+        app.BACKEND_START_TIMEOUT = 0.1
+        app.probe_backend = lambda: (False, "nope")
+        app.find_agent_canvas = lambda: "/usr/bin/agent-canvas"
+        app.port_in_use = lambda p: False
+        # This launch writes nothing.
+        app.subprocess.Popen = lambda argv, **kwargs: FakeProc()
+        try:
+            result = app.start_backend()
+        finally:
+            app.find_agent_canvas = original_canvas
+            app.port_in_use = original_in_use
+            app.subprocess.Popen = original_popen
+            app.probe_backend = original_probe
+            app.BACKEND_START_TIMEOUT = original_timeout
+            app.WORKSPACE_DIR = original_workspace
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "backend_timeout",
+                         "a stale collision line must not be reported as ours")
 
     def test_powershell_block_is_classified(self):
         stderr = ("npm : File C:\\Program Files\\nodejs\\npm.ps1 cannot be "

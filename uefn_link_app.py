@@ -973,6 +973,11 @@ def backend_log_since(log_path: str, start: int, limit: int = 4000) -> str:
         return ""
 
 
+# How long to wait for a freshly spawned backend to answer, in seconds. Module
+# level so tests can shrink it instead of sleeping through the real value.
+BACKEND_START_TIMEOUT = 90
+
+
 def start_backend(port: int | None = None) -> dict:
     """Start `agent-canvas --backend-only` and wait for it to answer.
 
@@ -1028,7 +1033,7 @@ def start_backend(port: int | None = None) -> dict:
         return fail_result(
             "backend_error", f"could not launch agent-canvas: {exc}")
 
-    deadline = time.monotonic() + 90
+    deadline = time.monotonic() + BACKEND_START_TIMEOUT
     while time.monotonic() < deadline:
         ok, detail = probe_backend()
         if ok:
@@ -1048,7 +1053,8 @@ def start_backend(port: int | None = None) -> dict:
         )
     return fail_result(
         "backend_timeout",
-        f"started but not answering after 90s (see {log_path})",
+        f"started but not answering after {BACKEND_START_TIMEOUT}s "
+        f"(see {log_path})",
     )
 
 
