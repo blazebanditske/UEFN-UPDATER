@@ -56,9 +56,24 @@ class BackendHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
 
+class UiBackendHandler(BackendHandler):
+    """A backend that also serves the Agent Canvas frontend, like a full
+    `agent-canvas` run (not --backend-only). Answers page routes with HTML."""
+
+    def do_GET(self):
+        if self.path == "/server_info":
+            return super().do_GET()
+        body = b"<!doctype html><html><body>Agent Canvas</body></html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class FakeBackend:
-    def __init__(self):
-        self.server = HTTPServer(("127.0.0.1", 0), BackendHandler)
+    def __init__(self, handler=BackendHandler):
+        self.server = HTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

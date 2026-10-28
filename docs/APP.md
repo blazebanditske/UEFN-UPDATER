@@ -89,7 +89,7 @@ What **Fix everything** does, in order:
 | install backend | Runs `npm install -g @openhands/agent-canvas` if it is missing |
 | start backend | Starts `agent-canvas --backend-only --port 3010` and waits for it to answer |
 | UEFN auto-start | Writes `bAutoStartServer=True` into UEFN's editor preferences |
-| UEFN project flags | Turns on Python Editor Scripting and UEFN MCP Toolsets in `.uefnproject` |
+| UEFN project flags | Turns on Python Editor Scripting and UEFN MCP Toolsets in `<Island>.uefnproject` |
 | UEFN connection | Checks the editor is actually answering |
 | model credential | Reports whether a model key exists |
 
@@ -104,9 +104,10 @@ backup the first time they write:
   gets a backup at `….ini.uefn-link.bak`. Only the three
   `ModelContextProtocol` keys are touched; the rest of the file is preserved
   byte for byte.
-- Your project's `.uefnproject` gets a backup at `.uefnproject.uefn-link.bak`.
-  Only the two beta flags are touched; everything else in the JSON is
-  preserved.
+- Your project's `<Island>.uefnproject` — the file is named after your island,
+  for example `myIsland.uefnproject` — gets a backup at
+  `<Island>.uefnproject.uefn-link.bak`. Only the two beta flags are touched;
+  everything else in the JSON is preserved.
 
 **Unreal Editor for Fortnite** — the editor is open, with your project, and its
 MCP server is answering.
@@ -327,7 +328,15 @@ Two files, both additive, both backed up on first write:
 | File | Keys written |
 | --- | --- |
 | `EditorPerProjectUserSettings.ini` | `bAutoStartServer`, `ServerPortNumber`, `ServerUrlPath` under `[/Script/ModelContextProtocol.ModelContextProtocolSettings]` |
-| `.uefnproject` | `dataSets.experimental.pythonExperimental.bEnablePythonForProject`, `dataSets.experimental.toolsets.bEnableToolsetsForProject` |
+| `<Island>.uefnproject` | `dataSets.experimental.pythonExperimental.bEnablePythonForProject`, `dataSets.experimental.toolsets.bEnableToolsetsForProject` |
+
+The project file is named after your island (`myIsland.uefnproject`), not
+`.uefnproject`. The app looks for any `*.uefnproject` file in a project folder.
+It searches `Documents\Fortnite Projects`, the OneDrive-redirected
+`OneDrive\Documents\Fortnite Projects`, and a tenant-named
+`OneDrive - <Org>\Documents\Fortnite Projects`. If it finds more than one
+project it picks the most recently edited, and you can always type the exact
+folder into the **UEFN project folder** box on the status card.
 
 The INI writer replaces only the exact keys it names, and only inside the named
 section, so a same-named key in another section is left alone.
@@ -368,6 +377,8 @@ section, so a same-named key in another section is left alone.
 | Agent has no UEFN tools | MCP servers apply to **new** conversations. Start another. Also check the server is registered on the *same backend* the conversation uses. |
 | Agent edits nothing | The project open in UEFN must be the one you mean. Check with `uefn-link doctor`. |
 | Browser did not open | Go to the URL printed in the terminal window. |
+| `No backend configured for this route` | The URL was a page route on the backend port, and this app runs agent-canvas with `--backend-only`, which has **no frontend**. Nothing is broken: the conversation exists, but only the hosted UI can display it. The app now opens the hosted UI automatically instead of that dead link. To browse conversations locally, run a full `agent-canvas` (no `--backend-only`) and add that backend under **Manage Backends**. |
+| `No UEFN project folder found` | The project file is named after your island (`myIsland.uefnproject`). Type the project folder into the **UEFN project folder** box on the status card and press Save. If OneDrive backs up your Documents, the folder is under `OneDrive\Documents\Fortnite Projects`. |
 | App says port busy | It picks a free port automatically. Check the terminal for the real URL. |
 
 ---

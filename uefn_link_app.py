@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 APP_NAME = "UEFN Link"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 DEFAULT_APP_PORT = 8765
 UEFN_MCP_URL = os.environ.get("UEFN_MCP_URL", "http://127.0.0.1:8000/mcp")
 # UEFN's embedded MCP server owns 8000 by default. The agent backend must not
@@ -285,6 +285,29 @@ def probe_backend(url: str | None = None, timeout: float = 4) -> tuple[bool, str
     if status == 401:
         return False, "running but key rejected"
     return False, "not running"
+
+
+def backend_has_ui(url: str, timeout: float = 4) -> bool:
+    """Does a browser UI exist at `url`, or is it backend-only?
+
+    This app starts agent-canvas with --backend-only, which runs agent-server
+    and the automation service behind ingress but mounts no frontend. The
+    ingress then answers every page route with 503 "No backend configured for
+    this route". Handing the user a conversation link on that port opens a
+    dead page, so the app checks before it points anyone there.
+
+    A real frontend answers / with HTML. Anything else -- a 503, a JSON error,
+    no answer at all -- means there is no UI to send the user to.
+    """
+    try:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            ctype = response.headers.get("Content-Type", "")
+            return "text/html" in ctype.lower()
+    except Exception:
+        return False
 
 
 def discover_backend(ports=None, probe=None) -> dict | None:
@@ -739,11 +762,12 @@ GUIDES = {
     ),
     "uefn_project_missing": _guide(
         "No UEFN project folder was found",
-        "Find your project: in UEFN it is the folder holding your .uefnproject "
-        "file, usually under Documents\\Fortnite Projects.",
-        "Close this app.",
-        "Open a terminal and point the app at that folder, then start it again:"
-        "  set UEFN_PROJECT_PATH=C:\\Users\\you\\Documents\\Fortnite Projects\\YourIsland",
+        "In UEFN, find the folder holding your project file. It is named "
+        "after your island — myIsland.uefnproject — and usually sits under "
+        "Documents\\Fortnite Projects. If OneDrive backs up your Documents, "
+        "look under OneDrive\\Documents\\Fortnite Projects instead.",
+        "Type that folder into the 'UEFN project folder' box above and press "
+        "Save. The app then remembers it.",
         "Press Fix everything.",
         done="The UEFN project flags step reports success.",
     ),
@@ -984,24 +1008,158 @@ def configure_uefn_autostart() -> dict:
     return ok_result("Auto Start Server enabled (takes effect next UEFN start)")
 
 
+def project_marker(folder: str) -> str | None:
+    """The .uefnproject file in `folder`, or None.
+
+    The file is named after the island -- `myIsland.uefnproject` -- not
+    `.uefnproject`. Every real tool globs `*.uefnproject` (FModel, UEFN-TOOLBELT,
+    verse-auto-imports, and UEFN's own log line "Opening project
+    '<name>.uefnproject'"), so matching the literal name `.uefnproject` finds
+    nothing and reports "no project folder" for a project that is right there.
+    """
+    if not os.path.isdir(folder):
+        return None
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    matches = [n for n in names if n.endswith(".uefnproject")]
+    if not matches:
+        return None
+    # Prefer the file named after the folder, so a folder holding more than one
+    # project resolves to the one it is named for rather than an arbitrary pick.
+    stem = os.path.basename(os.path.normpath(folder))
+    for name in matches:
+        if os.path.splitext(name)[0] == stem:
+            return os.path.join(folder, name)
+    return os.path.join(folder, sorted(matches)[0])
+
+
+def fortnite_project_roots() -> list[str]:
+    """Every Fortnite Projects folder this machine is likely to use.
+
+    Documents is not always `%USERPROFILE%\\Documents`: OneDrive's "Back up
+    folders" feature redirects it to `%USERPROFILE%\\OneDrive\\Documents`, and
+    UEFN follows the redirected folder. A machine with that setting on would
+    report "no project folder" while the project sits in plain sight.
+    """
+    roots = []
+    for env in ("USERPROFILE", "HOME"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        roots.append(os.path.join(base, "Documents", "Fortnite Projects"))
+        roots.append(os.path.join(base, "OneDrive", "Documents", "Fortnite Projects"))
+        # OneDrive may also be named for the tenant, e.g. OneDrive - Company.
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            entries = []
+        for name in entries:
+            if name.startswith("OneDrive"):
+                roots.append(os.path.join(
+                    base, name, "Documents", "Fortnite Projects"))
+    seen = []
+    for root in roots:
+        if root not in seen:
+            seen.append(root)
+    return seen
+
+
+def project_mtime(folder: str) -> float:
+    """When the project in `folder` was last edited, for picking between several.
+
+    A project folder's mtime moves when UEFN rewrites the project file or adds
+    content, so it tracks the project better than creation time would. A folder
+    we cannot stat sorts last rather than raising.
+    """
+    try:
+        return os.path.getmtime(folder)
+    except OSError:
+        return 0.0
+
+
 def find_uefn_project() -> str | None:
-    """Best guess at the UEFN project folder the user is working on."""
+    """Best guess at the UEFN project folder the user is working on.
+
+    Returns the folder, not the .uefnproject file inside it: the flags step and
+    the UI both work in terms of the folder. UEFN_PROJECT_PATH is an explicit
+    instruction, so it wins over the saved choice, which wins over discovery.
+    """
     explicit = os.environ.get("UEFN_PROJECT_PATH")
     if explicit and os.path.isdir(explicit):
         return explicit
-    candidates = []
-    for env in ("USERPROFILE", "HOME"):
-        base = os.environ.get(env)
-        if base:
-            candidates.append(os.path.join(base, "Documents", "Fortnite Projects"))
-    for root in candidates:
+    saved = load_project_path()
+    if saved and os.path.isdir(saved):
+        return saved
+    found = []
+    for root in fortnite_project_roots():
         if not os.path.isdir(root):
             continue
         for name in sorted(os.listdir(root)):
-            path = os.path.join(root, name)
-            if os.path.isfile(os.path.join(path, ".uefnproject")):
-                return path
-    return None
+            folder = os.path.join(root, name)
+            if project_marker(folder):
+                found.append(folder)
+    if not found:
+        return None
+    if len(found) == 1:
+        return found[0]
+    # More than one project. The most recently edited one is what the user was
+    # just working on; alphabetical order would pick an unrelated island and
+    # quietly write its flags.
+    return max(found, key=project_mtime)
+
+
+def project_settings_path() -> str:
+    """Path to the saved UEFN project folder choice.
+
+    A function, not a constant, for the same reason as backend_settings_path:
+    WORKSPACE_DIR is reassigned by main() and by tests.
+    """
+    return os.path.join(WORKSPACE_DIR, "project.json")
+
+
+def load_project_path() -> str:
+    """The project folder the user typed in, or "".
+
+    Lets someone whose project is not in a standard place — a different drive,
+    a OneDrive-redirected Documents, a custom folder — fix it in the UI instead
+    of restarting the app with an environment variable set.
+    """
+    try:
+        with open(project_settings_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(saved, dict):
+        return ""
+    path = saved.get("path")
+    return path if isinstance(path, str) else ""
+
+
+def save_project_path(path: str) -> tuple[bool, str]:
+    """Persist the project folder. Returns (ok, message).
+
+    Validated here rather than trusted later: a typo saved now would surface as
+    a confusing "no project folder" the next time Fix everything runs.
+    """
+    path = (path or "").strip().strip('"')
+    if not path:
+        return False, "type the folder that holds your project file"
+    if not os.path.isdir(path):
+        return False, f"that folder does not exist: {path}"
+    if not project_marker(path):
+        return False, (
+            f"no .uefnproject file in {path}. Pick the folder that holds your "
+            "project file, for example ...\\Fortnite Projects\\myIsland."
+        )
+    try:
+        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        with open(project_settings_path(), "w", encoding="utf-8") as handle:
+            json.dump({"path": path}, handle, indent=2)
+    except OSError as exc:
+        return False, f"could not save the folder: {exc}"
+    return True, f"UEFN project folder set to {path}"
 
 
 def enable_project_beta_flags(project: str | None = None) -> dict:
@@ -1016,8 +1174,8 @@ def enable_project_beta_flags(project: str | None = None) -> dict:
             "uefn_project_missing",
             "No UEFN project folder found.",
         )
-    marker = os.path.join(project, ".uefnproject")
-    if not os.path.isfile(marker):
+    marker = project_marker(project)
+    if not marker:
         return fail_result(
             "uefn_project_missing", f"no .uefnproject in {project}")
 
@@ -1060,9 +1218,10 @@ def uefn_setup_report() -> dict:
     ini = read_ini_keys(path, MCP_INI_SECTION, MCP_INI_KEYS.keys()) if path else {}
     project = find_uefn_project()
     flags = {}
-    if project:
+    marker = project_marker(project) if project else None
+    if marker:
         try:
-            with open(os.path.join(project, ".uefnproject"), encoding="utf-8") as fh:
+            with open(marker, encoding="utf-8") as fh:
                 data = json.load(fh)
             experimental = (data.get("dataSets") or {}).get("experimental") or {}
             for group, key in UEFN_PROJECT_FLAGS:
@@ -1205,6 +1364,20 @@ def backend_log_since(log_path: str, start: int, limit: int = 4000) -> str:
 # How long to wait for a freshly spawned backend to answer, in seconds. Module
 # level so tests can shrink it instead of sleeping through the real value.
 BACKEND_START_TIMEOUT = 90
+
+
+def conversation_link(backend_url: str, conversation_id: str) -> tuple[str, bool]:
+    """Where to open a conversation, as (url, opens_in_browser).
+
+    A conversation only has a page if a frontend is served. This app starts
+    agent-canvas --backend-only, which has none, so the old
+    `{backend}/conversations/{id}` link opened "No backend configured for this
+    route". When no UI is there, send the user to the hosted UI instead, which
+    drives the same local backend once it is added under Manage Backends.
+    """
+    if backend_has_ui(backend_url):
+        return f"{backend_url}/conversations/{conversation_id}", True
+    return CLOUD_CANVAS_URL, False
 
 
 def start_backend(port: int | None = None) -> dict:
@@ -1382,6 +1555,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self._backend_use()
         elif self.path == "/api/uefn/fix":
             self._uefn_fix()
+        elif self.path == "/api/project/save":
+            self._project_save()
         elif self.path == "/api/llm/save":
             self._llm_save()
         elif self.path == "/api/fix-all":
@@ -1453,6 +1628,7 @@ class AppHandler(BaseHTTPRequestHandler):
             "cli": has_openhands_cli(),
             "canvas": has_agent_canvas(),
             "workspace": WORKSPACE_DIR,
+            "project_path": find_uefn_project() or "",
             "uploads": staging_summary(),
             "cloud_url": CLOUD_CANVAS_URL,
             "env": environment_report(),
@@ -1492,6 +1668,15 @@ class AppHandler(BaseHTTPRequestHandler):
         flags = enable_project_beta_flags()
         results.append({"step": "project flags", **flags})
         self._json(200, {"ok": all(r["ok"] for r in results), "results": results})
+
+    def _project_save(self):
+        body = self._read_body() or b"{}"
+        try:
+            request = json.loads(body.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return self._json(400, {"error": "malformed request"})
+        ok, detail = save_project_path(request.get("path", ""))
+        self._json(200 if ok else 400, {"ok": ok, "detail": detail})
 
     def _llm_save(self):
         body = self._read_body() or b"{}"
@@ -1689,10 +1874,12 @@ class AppHandler(BaseHTTPRequestHandler):
             return self._json(500, {"error": f"Could not start (HTTP {status}).", "detail": str(result)[:300]})
 
         conversation_id = result.get("id") or result.get("conversation_id")
+        url, local_ui = conversation_link(back_url, conversation_id)
         self._json(200, {
             "ok": True,
             "id": conversation_id,
-            "url": f"{back_url}/conversations/{conversation_id}",
+            "url": url,
+            "local_ui": local_ui,
             "uploads_used": uploads,
         })
 
@@ -1772,6 +1959,11 @@ border-radius:8px;padding:8px;font:inherit;width:100%}
 <button class="ghost" onclick="refresh()">Re-check</button>
 <button class="ghost" id="btn-reg" onclick="register()">Register UEFN with OpenHands</button></div>
 <div class="note" id="workspace"></div>
+<div class="row" style="margin-top:8px">
+  <span class="label" style="flex:0 0 auto">UEFN project folder</span>
+  <input id="proj-path" placeholder="C:\\Users\\you\\Documents\\Fortnite Projects\\myIsland" style="flex:1;padding:8px;border-radius:8px;border:1px solid var(--line);background:#0f1216;color:var(--fg);margin:0 8px">
+  <button class="ghost sm" onclick="saveProject()">Save</button>
+</div>
 <div id="statusguides"></div>
 <div class="note" id="fixlog"></div>
 </div>
@@ -1865,6 +2057,8 @@ async function refresh(){
     $('f-llm').style.display=s.llm.ok?'none':'';
     $('btn-reg').style.display=s.cli?'':'none';
     $('workspace').textContent='Workspace: '+s.workspace+'  ·  v'+s.version;
+    const pp=$('proj-path');
+    if(pp&&!pp.dataset.touched&&s.project_path){pp.value=s.project_path}
     $('cloudbackendurl').innerHTML='Add this backend host: <code>'+s.backend.url+'</code>';
     syncBackendForm(s.backend);
     renderStatusGuides(s);
@@ -2055,6 +2249,18 @@ picker.onchange=e=>handleFiles(e.target.files);
   e.preventDefault();drop.classList.remove('over')}));
 drop.addEventListener('drop',e=>handleFiles(e.dataTransfer.files));
 
+async function saveProject(){
+  const input=$('proj-path');
+  input.dataset.touched='1';
+  try{
+    const r=await (await fetch('/api/project/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:input.value})})).json();
+    if(r.ok){show('ok',r.detail);input.dataset.touched=''}
+    else{show('err',r.detail||'Could not save the folder.')}
+  }catch(e){show('err','Could not save the folder: '+e)}
+  refresh();
+}
 async function go(){
   hide();const task=$('task').value.trim();
   if(!task){show('err','Describe what you want changed first.');return}
@@ -2064,8 +2270,11 @@ async function go(){
       headers:{'Content-Type':'application/json'},body:JSON.stringify({task})});
     const d=await r.json();
     if(d.ok){
-      show('ok','Agent started'+(d.uploads_used.length?' with '+d.uploads_used.length+' upload(s)':'')+
-        '.\\nOpening the conversation…');
+      const extra=d.uploads_used.length?' with '+d.uploads_used.length+' upload(s)':'';
+      show('ok','Agent started'+extra+'.\\n'+(d.local_ui
+        ? 'Opening the conversation…'
+        : 'This backend serves no web page of its own, so opening the hosted UI. '
+          +'Add this backend under Manage Backends to see the conversation there.'));
       setTimeout(()=>window.open(d.url,'_blank'),700);
     }else{
       show('err',d.error+(d.fix?'\\n\\n'+d.fix:'')+(d.detail?'\\n\\n'+d.detail:''));

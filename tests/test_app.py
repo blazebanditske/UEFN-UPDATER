@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from tests.fake_uefn import FakeUEFNServer  # noqa: E402
-from tests.test_bridge import BackendHandler, FakeBackend  # noqa: E402
+from tests.test_bridge import BackendHandler, FakeBackend, UiBackendHandler  # noqa: E402
 import uefn_link_app as app  # noqa: E402
 
 
@@ -696,6 +696,12 @@ class PageTests(unittest.TestCase):
         self.assertNotIn("__APP_NAME__", page)
         self.assertNotIn("__BACKEND__", page)
 
+    def test_page_offers_a_uefn_project_folder_box(self):
+        """The fix for "No UEFN project folder found": type the path in the UI."""
+        page = app.build_page()
+        self.assertIn('id="proj-path"', page)
+        self.assertIn("saveProject", page)
+
 
 class ApiTests(unittest.TestCase):
     def setUp(self):
@@ -816,7 +822,10 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(status, 200)
                     self.assertTrue(data["ok"])
                     self.assertEqual(data["uploads_used"], ["concept.png"])
-                    self.assertIn("conv-abc123", data["url"])
+                    # The fake backend serves no frontend, so the app must not
+                    # hand out a local page URL that would 503.
+                    self.assertFalse(data["local_ui"])
+                    self.assertEqual(data["url"], app.CLOUD_CANVAS_URL)
             finally:
                 app.UEFN_MCP_URL, app.BACKEND_URL = original_url, original_back
                 os.environ.pop("LOCAL_BACKEND_API_KEY", None)
@@ -1065,6 +1074,150 @@ class ProjectFlagTests(unittest.TestCase):
             self.assertEqual(result["code"], "uefn_project_unreadable")
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+class ConversationLinkTests(unittest.TestCase):
+    """The conversation link must never point at a page that 503s.
+
+    This app starts agent-canvas --backend-only, which mounts no frontend, so
+    the ingress answers every page route with "No backend configured for this
+    route". The app has to notice and send the user somewhere that works.
+    """
+
+    def test_backend_without_frontend_falls_back_to_hosted_ui(self):
+        with FakeBackend() as backend:  # JSON only, no HTML frontend
+            url, local = app.conversation_link(backend.url, "conv-1")
+            self.assertFalse(local)
+            self.assertEqual(url, app.CLOUD_CANVAS_URL)
+
+    def test_backend_with_frontend_gets_a_local_page(self):
+        with FakeBackend(UiBackendHandler) as backend:
+            url, local = app.conversation_link(backend.url, "conv-1")
+            self.assertTrue(local)
+            self.assertEqual(url, f"{backend.url}/conversations/conv-1")
+
+    def test_backend_has_ui_is_false_when_nothing_listens(self):
+        # Port 1 is reserved and never has a listener.
+        self.assertFalse(app.backend_has_ui("http://127.0.0.1:1"))
+
+    def test_backend_has_ui_rejects_non_html(self):
+        with FakeBackend() as backend:
+            self.assertFalse(app.backend_has_ui(backend.url))
+
+
+class UefnProjectDiscoveryTests(unittest.TestCase):
+    """Finding the project folder, which UEFN names <Island>.uefnproject."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = tempfile.mkdtemp()
+        self.original_env = {k: os.environ.get(k) for k in
+                             ("USERPROFILE", "HOME", "UEFN_PROJECT_PATH")}
+        self.original_workspace = app.WORKSPACE_DIR
+        app.WORKSPACE_DIR = os.path.join(self.tmp, "ws")
+        for key in ("USERPROFILE", "HOME", "UEFN_PROJECT_PATH"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self.original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        app.WORKSPACE_DIR = self.original_workspace
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def _project(self, root, name, marker_name=None):
+        folder = os.path.join(root, name)
+        os.makedirs(folder, exist_ok=True)
+        marker = os.path.join(folder, marker_name or f"{name}.uefnproject")
+        with open(marker, "w", encoding="utf-8") as fh:
+            json.dump({"dataSets": {}}, fh)
+        return folder
+
+    def test_finds_island_named_project_file(self):
+        """The regression: the file is myIsland.uefnproject, not .uefnproject."""
+        projects = os.path.join(self.home, "Documents", "Fortnite Projects")
+        folder = self._project(projects, "myIsland")
+        os.environ["USERPROFILE"] = self.home
+        self.assertEqual(app.find_uefn_project(), folder)
+
+    def test_finds_project_under_onedrive_documents(self):
+        """OneDrive redirects Documents; the old code only looked in one place."""
+        projects = os.path.join(
+            self.home, "OneDrive", "Documents", "Fortnite Projects")
+        folder = self._project(projects, "myIsland")
+        os.environ["USERPROFILE"] = self.home
+        self.assertEqual(app.find_uefn_project(), folder)
+
+    def test_finds_project_under_tenant_named_onedrive(self):
+        projects = os.path.join(
+            self.home, "OneDrive - Contoso", "Documents", "Fortnite Projects")
+        folder = self._project(projects, "myIsland")
+        os.environ["USERPROFILE"] = self.home
+        self.assertEqual(app.find_uefn_project(), folder)
+
+    def test_literal_dot_uefnproject_still_matches(self):
+        projects = os.path.join(self.home, "Documents", "Fortnite Projects")
+        folder = self._project(projects, "myIsland", marker_name=".uefnproject")
+        os.environ["USERPROFILE"] = self.home
+        self.assertEqual(app.find_uefn_project(), folder)
+
+    def test_most_recently_edited_project_wins(self):
+        projects = os.path.join(self.home, "Documents", "Fortnite Projects")
+        old = self._project(projects, "aaaOld")
+        new = self._project(projects, "zzzNew")
+        os.utime(old, (1_000_000, 1_000_000))
+        os.utime(new, (2_000_000, 2_000_000))
+        os.environ["USERPROFILE"] = self.home
+        self.assertEqual(app.find_uefn_project(), new)
+
+    def test_no_projects_returns_none(self):
+        os.environ["USERPROFILE"] = self.home
+        self.assertIsNone(app.find_uefn_project())
+
+    def test_explicit_env_wins(self):
+        projects = os.path.join(self.home, "Documents", "Fortnite Projects")
+        self._project(projects, "myIsland")
+        explicit = self._project(os.path.join(self.home, "elsewhere"), "Other")
+        os.environ["USERPROFILE"] = self.home
+        os.environ["UEFN_PROJECT_PATH"] = explicit
+        self.assertEqual(app.find_uefn_project(), explicit)
+
+    def test_flags_written_to_island_named_file(self):
+        """The whole point: the flags land in myIsland.uefnproject."""
+        projects = os.path.join(self.home, "Documents", "Fortnite Projects")
+        folder = self._project(projects, "myIsland")
+        os.environ["USERPROFILE"] = self.home
+        result = app.enable_project_beta_flags()
+        self.assertTrue(result["ok"], result["detail"])
+        with open(os.path.join(folder, "myIsland.uefnproject"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        exp = data["dataSets"]["experimental"]
+        self.assertTrue(exp["pythonExperimental"]["bEnablePythonForProject"])
+        self.assertTrue(exp["toolsets"]["bEnableToolsetsForProject"])
+
+    def test_saved_project_path_wins_over_discovery(self):
+        projects = os.path.join(self.home, "Documents", "Fortnite Projects")
+        self._project(projects, "myIsland")
+        custom = self._project(os.path.join(self.home, "custom"), "Other")
+        os.environ["USERPROFILE"] = self.home
+        ok, detail = app.save_project_path(custom)
+        self.assertTrue(ok, detail)
+        self.assertEqual(app.find_uefn_project(), custom)
+
+    def test_save_project_path_rejects_folder_without_marker(self):
+        empty = os.path.join(self.home, "empty")
+        os.makedirs(empty, exist_ok=True)
+        ok, detail = app.save_project_path(empty)
+        self.assertFalse(ok)
+        self.assertIn("no .uefnproject", detail)
+
+    def test_save_project_path_rejects_missing_folder(self):
+        ok, detail = app.save_project_path(os.path.join(self.home, "nope"))
+        self.assertFalse(ok)
+        self.assertIn("does not exist", detail)
 
 
 class LlmSaveTests(unittest.TestCase):
@@ -1387,7 +1540,9 @@ class BackendChoiceTests(unittest.TestCase):
                     status, data = srv.post("/api/start", {"task": "do a thing"})
                     self.assertEqual(status, 200, data)
                     self.assertTrue(data["ok"])
-                    self.assertIn("conv-abc123", data["url"])
+                    # The discovered backend has no frontend of its own.
+                    self.assertFalse(data["local_ui"])
+                    self.assertEqual(data["url"], app.CLOUD_CANVAS_URL)
             finally:
                 app.UEFN_MCP_URL = original_uefn
                 app.BACKEND_URL = original_back

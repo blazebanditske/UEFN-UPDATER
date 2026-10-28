@@ -192,6 +192,28 @@ These cost real debugging time to establish. Do not re-derive them.
 - The app therefore resolves the LLM key *before* starting a conversation and
   refuses with a clear message if there is none, instead of failing later.
 
+## agent-canvas serving modes, verified facts
+
+The app starts the backend with `--backend-only`. That choice has a visible
+consequence, and it caused a real bug.
+
+- `agent-canvas --backend-only` runs **agent-server + automation behind
+  ingress and mounts no frontend**. The ingress then answers every page route
+  (`/`, `/conversations/<id>`) with **HTTP 503 "No backend configured for this
+  route"**. Verified live against `@openhands/agent-canvas` 1.34.0: the
+  `/server_info`, `/api`, and `/sockets` routes work, page routes 503.
+- A **full** `agent-canvas` (no `--backend-only`) additionally starts a static
+  frontend service (port 3001) and passes `--default http://localhost:3001` to
+  ingress, so `/*` serves the UI. Verified live: `/` and `/conversations/<id>`
+  both return 200 with the 30 KB Agent Canvas HTML.
+- So `{backend}/conversations/{id}` is only a valid link when the backend was
+  started as a full stack. Handing that URL out for a `--backend-only` backend
+  opens the 503 page. `conversation_link()` probes for an HTML frontend and
+  falls back to the hosted UI (`CLOUD_CANVAS_URL`) when there is none.
+- `--backend-only` stays the default: it is the lean, reliable choice for the
+  agent's execution, and the UI is reachable at app.all-hands.dev once the
+  backend is added under **Manage Backends**.
+
 ## UEFN editor settings, verified facts
 
 What `POST /api/uefn/fix` writes, and why it is safe to write.
@@ -207,6 +229,19 @@ What `POST /api/uefn/fix` writes, and why it is safe to write.
 - `.uefnproject` is JSON. The beta flags live at
   `dataSets.experimental.pythonExperimental.bEnablePythonForProject` and
   `dataSets.experimental.toolsets.bEnableToolsetsForProject`.
+- **The project file is named after the island: `<Island>.uefnproject`** (for
+  example `myIsland.uefnproject`), not the literal `.uefnproject`. Verified
+  across FModel, `undergroundrap/UEFN-TOOLBELT` (`-Filter '*.uefnproject'`),
+  `vukefn/verse-auto-imports`, `KirChuvakov/uefn-mcp-server`, `UEFN-Ducky`, and
+  UEFN's own log line `Opening project '<name>.uefnproject'`. Matching the
+  literal name finds nothing and reports "No UEFN project folder found" for a
+  project that is right there — that was a real bug. Match `*.uefnproject`.
+- **Documents may be OneDrive-redirected.** With OneDrive "Back up folders" on,
+  projects live under `%USERPROFILE%\OneDrive\Documents\Fortnite Projects` (or
+  `OneDrive - <Org>\Documents\...`), and UEFN follows the redirect. Discovery
+  must check all of these or it reports no project on a normal machine.
+- When several projects exist, pick the most recently edited folder, not the
+  alphabetically first — otherwise the flags get written to an unrelated island.
 - Both writers back up to `<file>.uefn-link.bak` before the first change and are
   idempotent, so pressing Fix twice is harmless.
 - **These edits are necessary but not always sufficient.** Epic gates "UEFN MCP
