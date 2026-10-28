@@ -9,6 +9,10 @@ single button that sends instructions to UEFN.
 full step-by-step guide, including how to drive a live UEFN session from
 Agent Canvas or the app.all-hands.dev UI.
 
+**Building an actual game?** See
+[docs/BUILD-A-GAME.md](docs/BUILD-A-GAME.md) — the build loop from blank island
+to playable island, with the prompts and commands for each step.
+
 An agent-controlled link to **Unreal Editor for Fortnite (UEFN)**. It reads and
 writes Verse, builds it, drives the Scene Graph, configures Creative devices,
 runs play sessions, and executes Python inside the editor for asset work such as

@@ -217,6 +217,36 @@ What `POST /api/uefn/fix` writes, and why it is safe to write.
   that gate in code — report it. The app's fix-all says so explicitly rather
   than claiming success.
 
+## The build-loop playbook, verified facts
+
+`docs/BUILD-A-GAME.md` is the executable form of the community workflow
+(Epic's UEFN MCP doc + UnrealOps' "Build a Playable Fortnite Game with AI").
+The workflow itself is the asset; these are the facts behind it.
+
+- **The agent backend must run on the UEFN machine, whatever UI you drive it
+  from.** OpenHands Cloud conversations execute in cloud sandboxes, so
+  `127.0.0.1:8000` inside a Cloud conversation is the *sandbox's* loopback, not
+  the user's PC. There is no configuration that fixes this. The supported setup
+  is a local backend plus the app.all-hands.dev UI as the window onto it
+  (Track B1). Do not suggest a Cloud-backend MCP entry as a fix.
+- **MCP servers, LLM config, and settings are scoped per backend.** Adding the
+  UEFN server to the wrong backend looks like a broken server. `openhands mcp
+  add` must run on the UEFN machine.
+- **Sessions are Play-in-Client.** There is a separate client process to wait
+  on, and new assets need `session cycle --restart`; Verse edits do not.
+- **Verse device `@editable` references generally cannot be set over MCP.** The
+  agent places the device; a human assigns its device-reference fields in the
+  Details panel. The workflow doc states this as a real limit so users do not
+  read it as their own mistake. Do not claim the link is "fully" automatic.
+- **A written Verse file proves nothing until it compiles.** `verse build` is the
+  only correctness signal; UEFN reports errors at build time, not write time.
+- **Validation gates the session launch**, and it is where disallowed content
+  surfaces (assets that place fine in the editor can be rejected in an island).
+  The usual fix is an allowed look-alike in the same spot.
+- **Logs are not gameplay.** A clean client log and a broken game coexist. The
+  workflow's verification step is playing the island, and bug reports are
+  symptoms plus evidence, never a diagnosis.
+
 ## The failure-guide contract
 
 Every failure the app can surface must tell the user how to clear it. This is a
