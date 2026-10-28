@@ -1480,6 +1480,19 @@ class StatusPayloadTests(unittest.TestCase):
         self.assertIn("__APP_NAME__", app.PAGE)  # placeholder is in the template
         self.assertNotIn("__APP_NAME__", page)   # and substituted in the output
 
+    def test_hosted_ui_card_warns_off_the_cloud_backend(self):
+        """The app links to app.all-hands.dev, so it must say where the backend
+        goes. Adding UEFN MCP to the Cloud backend is the first thing people
+        try, and it cannot work: a Cloud conversation runs in a sandbox where
+        127.0.0.1 is the sandbox, not the machine running UEFN."""
+        page = app.build_page()
+        self.assertNotIn("__CLOUD_URL__", page)
+        self.assertIn(app.CLOUD_CANVAS_URL, page)
+        self.assertIn("Do not add the UEFN MCP server to the Cloud backend", page)
+        # The card shows the host to paste into Manage Backends, from status.
+        self.assertIn("s.backend.url", page)
+        self.assertIn("toggleCloudHelp", page)
+
 
 if __name__ == "__main__":
     unittest.main()

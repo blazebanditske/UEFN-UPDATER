@@ -1819,6 +1819,28 @@ border-radius:8px;padding:8px;font:inherit;width:100%}
 <div class="msg" id="msg"></div>
 <div class="note">The agent edits the project open in UEFN. Watch the editor while it works.</div>
 </div>
+
+<div class="card"><h2>Use the hosted OpenHands UI</h2>
+<div class="note">You can drive this same local backend from <b>app.all-hands.dev</b> instead of the conversation list above. The backend keeps running on this machine, so UEFN stays local and nothing is exposed to the internet.</div>
+<div class="actions">
+<button class="ghost" onclick="window.open('__CLOUD_URL__','_blank')">Open app.all-hands.dev</button>
+<button class="ghost" onclick="toggleCloudHelp()">How to connect it</button>
+</div>
+<div id="cloudhelp" style="display:none">
+<div class="note" style="border-left:3px solid var(--warn);padding-left:12px;margin-top:10px">
+<b>Do not add the UEFN MCP server to the Cloud backend.</b> Conversations on the Cloud backend run in a cloud sandbox, where <code>127.0.0.1</code> means the sandbox itself — not your PC. There is no UEFN there, and no URL makes it work. It shows up as a connection error or "0 tools", and retrying never fixes it.
+</div>
+<div class="note">Instead, point the hosted UI at the backend already running here:</div>
+<ol style="font-size:13px;padding-left:22px;margin:8px 0">
+<li>Open <b>app.all-hands.dev</b>, then the <b>backend switcher</b> in the top bar.</li>
+<li><b>Manage Backends</b> → <b>Add Backend</b>.</li>
+<li>Host: this machine's backend URL. Session API key: the key from <code>~/.openhands/agent-canvas/api-key.txt</code>.</li>
+<li>Save, then switch to it. UEFN MCP is registered against this backend, so the tools come with it.</li>
+</ol>
+<div class="note">MCP servers, model settings, and secrets are <b>per backend</b>. If the agent cannot see UEFN after switching, you are on the wrong backend — switch back and re-run <b>Register UEFN with OpenHands</b>.</div>
+<div class="note" id="cloudbackendurl"></div>
+</div>
+</div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -1827,6 +1849,7 @@ function fmt(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+
 if(b<1073741824)return (b/1048576).toFixed(1)+' MB';return (b/1073741824).toFixed(2)+' GB'}
 function show(kind,text){const m=$('msg');m.className='msg show '+kind;m.textContent=text}
 function hide(){$('msg').className='msg'}
+function toggleCloudHelp(){const b=$('cloudhelp');b.style.display=b.style.display==='none'?'':'none'}
 
 async function refresh(){
   try{
@@ -1842,6 +1865,7 @@ async function refresh(){
     $('f-llm').style.display=s.llm.ok?'none':'';
     $('btn-reg').style.display=s.cli?'':'none';
     $('workspace').textContent='Workspace: '+s.workspace+'  ·  v'+s.version;
+    $('cloudbackendurl').innerHTML='Add this backend host: <code>'+s.backend.url+'</code>';
     syncBackendForm(s.backend);
     renderStatusGuides(s);
     if(!presets.length&&s.presets){presets=s.presets;fillPresets()}
@@ -2068,6 +2092,7 @@ def build_page() -> str:
         PAGE.replace("__APP_NAME__", APP_NAME)
         .replace("__BACKEND__", effective_backend_url())
         .replace("__BACKEND_PORT__", str(DEFAULT_BACKEND_PORT))
+        .replace("__CLOUD_URL__", CLOUD_CANVAS_URL)
     )
 
 
