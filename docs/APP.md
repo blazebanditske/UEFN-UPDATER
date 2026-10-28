@@ -307,6 +307,7 @@ is exposed to the network.
 | `POST /api/backend/start` | starts `agent-canvas --backend-only --port 3010` and waits for it |
 | `POST /api/backend/use` | saves which backend to use: automatic, this app's own, or a custom URL |
 | `POST /api/uefn/fix` | writes UEFN's auto-start setting and the project beta flags |
+| `POST /api/project/save` | saves the UEFN project folder you typed in |
 | `POST /api/llm/save` | saves a model key to `agent_settings.json` |
 | `POST /api/upload` | saves a file to `~/UEFN-Agent/uploads/` |
 | `POST /api/start` | starts a conversation with your instruction |
@@ -316,6 +317,13 @@ is exposed to the network.
 `POST /api/start` sends the model configuration with the conversation
 (`agent.llm`). The backend rejects a conversation without it — HTTP 422 — so the
 app resolves the key first and refuses to start if there is none.
+
+The response includes `url` (where to read the conversation) and `local_ui`
+(whether that URL is a local page). This app runs the backend with
+`--backend-only`, which serves no frontend, so `{backend}/conversations/{id}`
+would answer HTTP 503 "No backend configured for this route". The app probes
+for a frontend first: if there is one it opens the local page, otherwise it
+opens the hosted UI and `local_ui` is false.
 
 The agent is started with a system prompt that encodes the rules that matter:
 compile Verse after writing it, only write UI-visible properties, restart the
